@@ -1,0 +1,2973 @@
+---
+title: "Study_1"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set( 
+  echo = TRUE, 
+  message = FALSE, 
+  warning = FALSE 
+  )
+```
+
+# Setup
+
+```{r}
+library(tidyverse)
+library(psych)
+library(emmeans)
+library(janitor)
+library(effectsize)
+library(broom)
+library(kableExtra)
+library(corrplot)
+library(ggstatsplot)
+library(dplyr)
+library(tidytext) 
+library(topicmodels)
+library(lme4)          
+library(lmerTest) 
+library(broom.mixed)
+library(lubridate)
+library(tidyr)
+library(knitr)
+library(purrr)
+library(ggdist)
+
+
+# helper rescale to 0-1
+rescale01 <- function(x, min_val, max_val) {
+  (x - min_val) / (max_val - min_val)
+}
+```
+
+```{r review-helpers}
+
+STUDY_NUM <- "1"
+STUDY_TAG <- "s1"
+
+# p-value and significance formatting used by all new exports (LaTeX-safe).
+fmt_p3 <- function(p) ifelse(is.na(p), "",
+                      ifelse(p < 0.001, "$<$0.001", sprintf("%.3f", p)))
+p_txt  <- function(p) ifelse(p < 0.001, "< .001", sprintf("= %.3f", p))   # for prose
+stars3 <- function(p) dplyr::case_when(is.na(p) ~ "", p < .001 ~ "***", p < .01 ~ "**",
+                                       p < .05 ~ "*", p < .10 ~ "†", TRUE ~ "")
+stars_tex <- function(s) gsub("†", "$\\dagger$", s, fixed = TRUE)
+
+# Study 2 has group_display_labels but not relabel_groups_in_string; define it
+# if missing so every export uses the same \textsc{} labels.
+if (!exists("relabel_groups_in_string")) {
+  relabel_groups_in_string <- function(x) {
+    keys <- names(group_display_labels)[order(-nchar(names(group_display_labels)))]
+    for (k in keys) x <- gsub(k, group_display_labels[[k]], x, fixed = TRUE)
+    x
+  }
+}
+
+# Sample-flow recorder for Table 1 (see section D). `key` is a stable id used
+# by the Table 1 assembler; `step` is the human-readable row label.
+flow <- tibble::tibble(key = character(), step = character(), n = integer(), note = character())
+flow_add <- function(flow, key, step, n, note = "") {
+  dplyr::bind_rows(flow, tibble::tibble(key = key, step = step, n = as.integer(n), note = note))
+}
+
+if (!dir.exists("tables")) dir.create("tables")
+```
+
+# Data Import
+
+```{r data-import}
+# File names: Study 1 as below; Study 2 uses ../data/Study_2_Pre_/Post_..._April22_2026.csv
+pre_raw  <- read_csv("../data/Study1_Pre_Refugee_Attitude_Study_March_31_2026.csv")[-c(1, 2), ]
+post_raw <- read_csv("../data/Study1_Post_Refugee_Attitude_Study_March_31_2026.csv")[-c(1, 2), ]
+flow <- flow_add(flow, "qualtrics_pre_rows",  "Pre-survey responses recorded (Qualtrics rows, incl. incomplete/duplicate)",  nrow(pre_raw))
+flow <- flow_add(flow, "qualtrics_post_rows", "Post-survey responses recorded (Qualtrics rows, incl. incomplete/duplicate)", nrow(post_raw))
+
+# Diagnostics behind the "duplicates/incomplete" row of Table 1.
+finished_ok <- function(x) toupper(as.character(x)) %in% c("TRUE", "1")
+cat(sprintf(paste0("Pre : %d rows, %d not Finished, %d duplicated Prolific IDs\n",
+                   "Post: %d rows, %d not Finished, %d duplicated Prolific IDs\n"),
+            nrow(pre_raw),  sum(!finished_ok(pre_raw$Finished)),  sum(duplicated(pre_raw$PROLIFIC_PID)),
+            nrow(post_raw), sum(!finished_ok(post_raw$Finished)), sum(duplicated(post_raw$PROLIFIC_PID))))
+
+# The pipeline used for the manuscript keeps the FIRST row per Prolific ID
+# without checking Finished (unlike the Study 3 follow-up script, which filters
+# Finished == TRUE first). APPLY_FINISHED_FILTER <- TRUE drops unfinished rows
+# before de-duplication. Keep FALSE to reproduce the reported N; if TRUE changes
+# N, that is a genuine cleaning decision to report in Table 1.
+APPLY_FINISHED_FILTER <- FALSE
+pre  <- pre_raw
+post <- post_raw
+if (APPLY_FINISHED_FILTER) {
+  pre  <- dplyr::filter(pre,  finished_ok(Finished))
+  post <- dplyr::filter(post, finished_ok(Finished))
+}
+pre  <- dplyr::distinct(pre,  PROLIFIC_PID, .keep_all = TRUE)
+post <- dplyr::distinct(post, PROLIFIC_PID, .keep_all = TRUE)
+data <- dplyr::inner_join(pre, post, by = "PROLIFIC_PID")
+flow <- flow_add(flow, "matched_unique", "Unique participants with matched pre- and post-survey", nrow(data),
+                 note = if (APPLY_FINISHED_FILTER) "unfinished rows dropped before de-duplication"
+                        else "first row per Prolific ID kept; Finished not checked")
+n_kept_unfinished <- sum(!finished_ok(data$Finished.x) | !finished_ok(data$Finished.y))
+cat(sprintf("Matched participants whose kept pre or post row is not marked Finished: %d\n", n_kept_unfinished))
+
+
+PROLIFIC_EXPORT <- NA_character_     # <- actual file, or NA_character_
+if (!is.na(PROLIFIC_EXPORT) && file.exists(PROLIFIC_EXPORT)) {
+  prolific <- read_csv(PROLIFIC_EXPORT, show_col_types = FALSE) %>%
+    dplyr::rename_with(~ gsub("[^A-Za-z]", "_", .x))            # "Participant id" -> "Participant_id"
+  status <- toupper(trimws(prolific$Status))
+  flow <- flow_add(flow, "prolific_started",  "Prolific submissions started (all statuses)", nrow(prolific))
+  flow <- flow_add(flow, "prolific_approved", "Prolific submissions approved or awaiting review",
+                   sum(status %in% c("APPROVED", "AWAITING REVIEW")))
+  bad_ids  <- prolific$Participant_id[status %in% c("RETURNED", "REJECTED", "TIMED-OUT", "TIMED OUT")]
+  n_before <- nrow(data)
+  data     <- dplyr::filter(data, !PROLIFIC_PID %in% bad_ids)
+  flow <- flow_add(flow, "after_returned", "After removing submissions returned/rejected/timed out on Prolific",
+                   nrow(data), note = sprintf("%d removed", n_before - nrow(data)))
+} else {
+  flow <- flow_add(flow, "after_returned", "After removing submissions returned/rejected/timed out on Prolific",
+                   nrow(data), note = "no Prolific export supplied; nothing removed")
+}
+nrow(pre); nrow(post); nrow(data)
+```
+
+## Streamlined condition naming (matches the paper)
+
+```{r}
+
+condition_recode <- c(
+  "interview" = "self_reflection",
+  "flyer"     = "static_information"
+)
+
+# Display labels used in tables, captions, plot titles and facets.
+condition_labels <- c(
+  neutral            = "Neutral",
+  debunking          = "Debunking",
+  self_reflection    = "Interview",
+  empathy            = "Empathy",
+  roleplay           = "Roleplay",
+  static_information = "Static Information"
+)
+
+
+condition_order <- c(
+  "neutral", "debunking", "self_reflection",
+  "empathy", "roleplay", "static_information"
+)
+
+
+treatment_order <- c("neutral", "debunking", "self_reflection",
+                     "empathy", "roleplay")
+
+# Canonical DV display labels (drop the legacy "Attitudes" label for DV1).
+dv_labels <- c(
+  DV1 = "Perceptions",
+  DV2 = "Refugee Support",
+  DV3 = "Policy Endorsement"
+)
+
+data <- data %>%
+  mutate(
+    Group = dplyr::recode(Group, !!!condition_recode),
+    Group = factor(Group, levels = condition_order)
+  )
+```
+
+
+# Data Cleaning
+
+```{r}
+# anonymize IDs
+data <- data %>%
+  mutate(anon_id = paste0("P", row_number()))
+
+#drop completely empty columns
+data <- data %>% select(where(~ sum(!is.na(.)) > 2))
+
+# Drop further unnecessary columns
+cols_to_remove <- c(
+  "Status.x", "Status.y",
+  "IPAddress.x", "IPAddress.y",
+  "Finished.x", "Finished.y",
+  "RecordedDate.x", "RecordedDate.y",
+  "ResponseId.x", "ResponseId.y",
+  "LocationLatitude.x", "LocationLatitude.y",
+  "LocationLongitude.x", "LocationLongitude.y",
+  "DistributionChannel.x", "DistributionChannel.y",
+  "UserLanguage.x", "UserLanguage.y",
+  "Progress.x", "Progress.y",
+  "STUDY_ID.x", "STUDY_ID.y",
+  "SESSION_ID.x", "SESSION_ID.y", "BOT_TYPE"
+)
+
+data <- data %>%
+  select(-any_of(cols_to_remove))
+
+# Check group sizes
+group_table <- data %>%
+  count(Group) %>%
+  arrange(Group)
+
+group_table %>%
+  kable(col.names = c("Condition", "n"),
+        caption = "Sample Size per Experimental Condition") %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+
+
+## Exclusions
+
+```{r exclusions}
+## 1. Attention check (embedded in pre- and post-survey; instructed response "Often")
+data <- data %>%
+  dplyr::mutate(attention_pass = (!is.na(attention_check.x) & attention_check.x == "Often") &
+                                 (!is.na(attention_check.y) & attention_check.y == "Often"))
+print(table(data$attention_pass, data$Group, useNA = "ifany"))
+n_before <- nrow(data)
+data <- dplyr::filter(data, attention_pass %in% TRUE)
+flow <- flow_add(flow, "excl_attention",  "Excluded: failed attention check", n_before - nrow(data))
+flow <- flow_add(flow, "after_attention", "After attention-check exclusion",  nrow(data))
+
+## 2. Completion time < 1/3 of the condition-specific median
+data <- data %>%
+  dplyr::mutate(
+    StartDate.x = na_if(StartDate.x, ""),
+    EndDate.y   = na_if(EndDate.y, ""),
+    StartDate.x = parse_date_time(StartDate.x, orders = c("Ymd HMS", "Y-m-d H:M:S", "m/d/Y H:M", "d.m.Y H:M:S")),
+    EndDate.y   = parse_date_time(EndDate.y,   orders = c("Ymd HMS", "Y-m-d H:M:S", "m/d/Y H:M", "d.m.Y H:M:S")),
+    total_time_min = as.numeric(difftime(EndDate.y, StartDate.x, units = "mins"))
+  ) %>%
+  dplyr::group_by(Group) %>%
+  dplyr::mutate(threshold  = median(total_time_min, na.rm = TRUE) / 3,
+                speed_flag = total_time_min < threshold) %>%
+  dplyr::ungroup()
+cat(sprintf("Participants with missing completion time: %d\n", sum(is.na(data$total_time_min))))
+print(table(data$speed_flag, data$Group, useNA = "ifany"))
+n_before <- nrow(data)
+data <- dplyr::filter(data, speed_flag %in% FALSE)      # NA times are excluded too (as before); reported above
+flow <- flow_add(flow, "excl_speed",  "Excluded: completion time < 1/3 of condition median", n_before - nrow(data))
+flow <- flow_add(flow, "after_speed", "After completion-time exclusion", nrow(data))
+
+## 3. Low-effort reflection (< 3 words in the mandatory open-ended item)
+data <- data %>%
+  dplyr::mutate(post_reflection      = as.character(post_reflection),
+                reflection_wordcount = dplyr::coalesce(stringr::str_count(post_reflection, "\\w+"), 0L),
+                low_effort           = reflection_wordcount < 3)
+print(table(data$low_effort, data$Group, useNA = "ifany"))
+n_before <- nrow(data)
+data <- dplyr::filter(data, low_effort %in% FALSE)
+flow <- flow_add(flow, "excl_loweffort",  "Excluded: fewer than three words in the reflection item", n_before - nrow(data))
+flow <- flow_add(flow, "after_loweffort", "After low-effort exclusion", nrow(data))
+
+## Final analytic sample
+flow <- flow_add(flow, "final", "Final sample size", nrow(data))
+stopifnot(nrow(data) == c("1" = 554L, "2" = 250L)[[STUDY_NUM]])   # guards against silent drift
+
+print(dplyr::count(data, Group))
+knitr::kable(flow, caption = sprintf("Study %s: sample flow (Supplement Table 1)", STUDY_NUM)) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center")
+readr::write_csv(dplyr::mutate(flow, study = STUDY_NUM, order = dplyr::row_number()),
+                 sprintf("tables/study%s_sample_flow.csv", STUDY_NUM))
+```
+
+
+# DV Construction
+
+```{r}
+# Convert all DV items to numeric
+data <- data %>%
+  mutate(
+    across(starts_with("pre_attitudes"),  as.numeric),
+    across(starts_with("post_attitudes"), as.numeric),
+    across(starts_with("pre_support"),    as.numeric),
+    across(starts_with("post_support"),   as.numeric),
+    across(starts_with("pre_policy"),     as.numeric),
+    across(starts_with("post_policy"),    as.numeric)
+  ) %>%
+  
+  # Rescale everything to 0–1 
+  mutate(
+    # Perceptions: Likert 1–5
+    across(starts_with("pre_attitudes"),  ~ rescale01(., 1, 5)),
+    across(starts_with("post_attitudes"), ~ rescale01(., 1, 5)),
+    
+    # Support: 0–100 sliders
+    across(starts_with("pre_support"),    ~ rescale01(., 0, 100)),
+    across(starts_with("post_support"),   ~ rescale01(., 0, 100)),
+    
+    # Policy: 0–100 sliders
+    across(starts_with("pre_policy"),     ~ rescale01(., 0, 100)),
+    across(starts_with("post_policy"),    ~ rescale01(., 0, 100))
+  ) %>%
+  
+  # Create DV indices
+  mutate(
+    DV1_pre  = rowMeans(select(., starts_with("pre_attitudes")),  na.rm = TRUE),
+    DV1_post = rowMeans(select(., starts_with("post_attitudes")), na.rm = TRUE),
+    
+    DV2_pre  = rowMeans(select(., starts_with("pre_support")),    na.rm = TRUE),
+    DV2_post = rowMeans(select(., starts_with("post_support")),   na.rm = TRUE),
+    
+    DV3_pre  = rowMeans(select(., starts_with("pre_policy")),     na.rm = TRUE),
+    DV3_post = rowMeans(select(., starts_with("post_policy")),    na.rm = TRUE)
+  )
+
+
+
+## Reliability (Cronbach's alpha)
+
+# Compute alphas for each DV index (using item sets)
+alpha_DV1_pre  <- psych::alpha(select(data, starts_with("pre_attitudes")))
+alpha_DV1_post <- psych::alpha(select(data, starts_with("post_attitudes")))
+
+alpha_DV2_pre  <- psych::alpha(select(data, starts_with("pre_support")))
+alpha_DV2_post <- psych::alpha(select(data, starts_with("post_support")))
+
+alpha_DV3_pre  <- psych::alpha(select(data, starts_with("pre_policy")))
+alpha_DV3_post <- psych::alpha(select(data, starts_with("post_policy")))
+
+# Build summary table (scale names follow the canonical DV labels used
+# throughout the results -- Perceptions / Refugee Support / Policy
+# Endorsement -- instead of the raw DV1/DV2/DV3 variable names)
+reliability_summary <- tibble(
+  Scale     = rep(c("Perceptions", "Refugee Support", "Policy Endorsement"), each = 2),
+  Timepoint = rep(c("Pre", "Post"), times = 3),
+
+  alpha = c(alpha_DV1_pre$total$raw_alpha,
+            alpha_DV1_post$total$raw_alpha,
+            alpha_DV2_pre$total$raw_alpha,
+            alpha_DV2_post$total$raw_alpha,
+            alpha_DV3_pre$total$raw_alpha,
+            alpha_DV3_post$total$raw_alpha)
+)
+
+
+study1_reliability_summary_kbl <- reliability_summary %>%
+  select(Timepoint, alpha) %>%
+  kable(digits = 3,
+        col.names = c("Timepoint", "Cronbach's alpha"),
+        caption = "Reliability Summary for Pre/Post Perceptions, Support, and Policy Scales",
+        format = "latex",
+        booktabs = TRUE) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+  kableExtra::pack_rows("Perceptions", 1, 2, hline_before = TRUE) %>%
+  kableExtra::pack_rows("Refugee Support", 3, 4, hline_before = TRUE) %>%
+  kableExtra::pack_rows("Policy Endorsement", 5, 6, hline_before = TRUE)
+
+kableExtra::save_kable(
+  study1_reliability_summary_kbl,
+  file = "tables/study1_reliability_summary.tex"
+)
+
+# HTML version, shown inline in the knitted document
+study1_reliability_summary_table <- reliability_summary %>%
+  select(Timepoint, alpha) %>%
+  kable(digits = 3,
+        col.names = c("Timepoint", "Cronbach's alpha"),
+        caption = "Reliability Summary for Pre/Post Perceptions, Support, and Policy Scales") %>%
+  kable_styling(full_width = FALSE, position = "center") %>%
+  pack_rows("Perceptions", 1, 2) %>%
+  pack_rows("Refugee Support", 3, 4) %>%
+  pack_rows("Policy Endorsement", 5, 6)
+
+study1_reliability_summary_table
+
+```
+
+
+# Descriptive Statistics
+
+```{r}
+## Descriptive statistics for DVs (pre + post)
+
+descriptives <- data %>%
+  select(
+    DV1_pre,  DV1_post,
+    DV2_pre,  DV2_post,
+    DV3_pre,  DV3_post
+  ) %>%
+  psych::describe() %>%
+  as.data.frame() %>%
+  rownames_to_column("Variable") %>%
+  select(
+    Variable, n, mean, sd, median, min, max, skew, kurtosis
+  ) %>%
+  mutate(
+    Variable = paste0(
+      dv_labels[str_extract(Variable, "^DV[0-9]+")],
+      " (", str_to_title(str_extract(Variable, "pre|post")), ")"
+    )
+  )
+
+# LaTeX version for export (same "_kbl" + save_kable pattern used for the
+# reliability/demographics tables above), saved to tables/
+study1_descriptives_kbl <- descriptives %>%
+  kable(digits = 3,
+        caption = "Descriptive Statistics for Pre/Post Dependent Variables",
+        format = "latex",
+        booktabs = TRUE) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center")
+
+kableExtra::save_kable(
+  study1_descriptives_kbl,
+  file = "tables/study1_descriptive_statistics_table.tex"
+)
+
+# HTML version, shown inline in the knitted document
+descriptives %>%
+  kable(digits = 3,
+        caption = "Descriptive Statistics for Pre/Post Dependent Variables") %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+
+```
+
+
+
+# Confirmatory Analysis
+
+```{r}
+
+
+
+
+data_treatments <- data %>%
+  filter(Group != "static_information") %>%
+  mutate(Group = droplevels(Group))
+
+# PRE long data
+pre_long <- data_treatments %>%
+  select(anon_id, Group, DV1_pre, DV2_pre, DV3_pre) %>%
+  pivot_longer(
+    cols = starts_with("DV"),
+    names_to = "DV",
+    values_to = "score"
+  ) %>%
+  mutate(time = "Pre")
+
+# POST long data
+post_long <- data_treatments %>%
+  select(anon_id, Group, DV1_post, DV2_post, DV3_post) %>%
+  pivot_longer(
+    cols = starts_with("DV"),
+    names_to = "DV",
+    values_to = "score"
+  ) %>%
+  mutate(
+    time = "Post",
+    DV = case_when(
+      DV == "DV1_post" ~ "DV1",
+      DV == "DV2_post" ~ "DV2",
+      DV == "DV3_post" ~ "DV3"
+    )
+  )
+
+# Combine into long LMM dataset
+lmm_data <- bind_rows(
+  pre_long %>% mutate(DV = case_when(
+    DV == "DV1_pre" ~ "DV1",
+    DV == "DV2_pre" ~ "DV2",
+    DV == "DV3_pre" ~ "DV3"
+  )),
+  post_long
+) %>%
+  mutate(
+    time = factor(time, levels = c("Pre", "Post")),
+    Group = factor(Group),
+    Group = relevel(Group, ref = "neutral")
+  )
+
+
+# 2. FIT LMMs (must come BEFORE contrast extraction)
+
+lmm_DV1 <- lmer(score ~ Group * time + (1 | anon_id),
+                data = filter(lmm_data, DV == "DV1"))
+
+lmm_DV2 <- lmer(score ~ Group * time + (1 | anon_id),
+                data = filter(lmm_data, DV == "DV2"))
+
+lmm_DV3 <- lmer(score ~ Group * time + (1 | anon_id),
+                data = filter(lmm_data, DV == "DV3"))
+
+
+
+
+one_sided_p <- function(p_two, estimate) {
+  ifelse(estimate > 0, p_two / 2, 1 - p_two / 2)
+}
+
+sig_stars <- function(p) {
+  if (is.na(p))   return("")
+  if (p < 0.001)  return("***")
+  if (p < 0.01)   return("**")
+  if (p < 0.05)   return("*")
+  if (p < 0.10)   return("dagger")
+  return("")
+}
+
+
+term_labels <- c(
+  "(Intercept)"                   = "Intercept (\\textsc{Neutral~1}, pre)",
+  "timePost"                      = "Post",
+  "Groupdebunking"                = "\\textsc{Debunking}",
+  "Groupself_reflection"          = "\\textsc{Interview}",
+  "Groupempathy"                  = "\\textsc{Empathy}",
+  "Grouproleplay"                 = "\\textsc{Roleplay}",
+  "Groupdebunking:timePost"       = "\\textsc{Debunking} \u00D7 Post",
+  "Groupself_reflection:timePost" = "\\textsc{Interview} \u00D7 Post",
+  "Groupempathy:timePost"         = "\\textsc{Empathy} \u00D7 Post",
+  "Grouproleplay:timePost"        = "\\textsc{Roleplay} \u00D7 Post"
+)
+
+
+relabel_term <- function(term) {
+  out <- unname(term_labels[term])
+  out[is.na(out)] <- term[is.na(out)]
+  out
+}
+
+
+group_display_labels <- c(
+  neutral             = "\\textsc{Neutral}",
+  debunking           = "\\textsc{Debunking}",
+  self_reflection     = "\\textsc{Interview}",
+  empathy             = "\\textsc{Empathy}",
+  roleplay            = "\\textsc{Roleplay}",
+  static_information  = "\\textsc{Static~Information}"
+)
+
+relabel_groups_in_string <- function(x) {
+  keys <- names(group_display_labels)[order(-nchar(names(group_display_labels)))]
+  for (key in keys) {
+    x <- gsub(key, group_display_labels[[key]], x, fixed = TRUE)
+  }
+  x
+}
+
+# Holm-within-DV: applied across the 4 Group:timePost interaction contrasts.
+holm_within_dv <- function(terms, p_vals) {
+  is_target <- grepl("^Group.*:timePost$", terms)
+  out <- rep(NA_real_, length(p_vals))
+  out[is_target] <- p.adjust(p_vals[is_target], method = "holm")
+  out
+}
+
+make_fixed_effects_table <- function(model) {
+  anova(model) %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("Effect") %>%
+    mutate(
+      F = round(`F value`, 3),
+      # Omnibus F-tests are non-directional; no one-sided version exists.
+      p_value = round(`Pr(>F)`, 4),
+      stars = map_chr(p_value, sig_stars)
+    ) %>%
+    select(Effect, NumDF, DenDF, F, p_value, stars)
+}
+
+make_coef_table <- function(model) {
+  tidy(model, effects = "fixed") %>%
+    mutate(
+      p_one_raw   = one_sided_p(p.value, estimate),
+      Estimate    = round(estimate, 3),
+      SE          = round(std.error, 3),
+      t           = round(statistic, 3),
+      # p_one_raw is kept only as the input to the Holm correction below;
+      # the uncorrected p-value is intentionally not exposed in the table.
+      p_holm_within_dv = round(holm_within_dv(term, p_one_raw), 4),
+      stars = map_chr(p_holm_within_dv, sig_stars),
+      Term = relabel_term(term)
+    ) %>%
+    # Keep only the 4 Group:timePost interaction contrasts (the terms the
+    # Holm correction above actually targets); drop Intercept, main
+    # effects of Group, and the main effect of time.
+    filter(grepl("^Group.*:timePost$", term)) %>%
+    select(Term, Estimate, SE, t, p_holm_within_dv, stars)
+}
+
+# Tables
+table_DV1_fixed <- make_fixed_effects_table(lmm_DV1)
+table_DV1_coef  <- make_coef_table(lmm_DV1)
+
+table_DV2_fixed <- make_fixed_effects_table(lmm_DV2)
+table_DV2_coef  <- make_coef_table(lmm_DV2)
+
+table_DV3_fixed <- make_fixed_effects_table(lmm_DV3)
+table_DV3_coef  <- make_coef_table(lmm_DV3)
+
+
+if (!dir.exists("tables")) {
+  dir.create("tables")
+}
+
+save_fixed_effects_tex <- function(tbl, dv_key, file) {
+  tbl %>%
+    kable(
+      digits = 3,
+      caption = paste0(dv_labels[[dv_key]], " (", dv_key, "): Omnibus Fixed-Effects (Type III) Tests"),
+      format = "latex",
+      booktabs = TRUE
+    ) %>%
+    kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+    kableExtra::save_kable(file = file)
+}
+
+save_coef_tex <- function(tbl, dv_key, file) {
+  tbl %>%
+    kable(
+      digits = 3,
+      caption = paste0(dv_labels[[dv_key]], " (", dv_key, "): Fixed-Effect Coefficients (One-Sided, Holm-within-DV)"),
+      format = "latex",
+      booktabs = TRUE,
+      escape = FALSE
+    ) %>%
+    kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+    kableExtra::save_kable(file = file)
+}
+
+save_fixed_effects_tex(table_DV1_fixed, "DV1", "tables/study1_dv1_fixed_effects.tex")
+save_coef_tex(table_DV1_coef, "DV1", "tables/study1_dv1_coefficients.tex")
+
+save_fixed_effects_tex(table_DV2_fixed, "DV2", "tables/study1_dv2_fixed_effects.tex")
+save_coef_tex(table_DV2_coef, "DV2", "tables/study1_dv2_coefficients.tex")
+
+save_fixed_effects_tex(table_DV3_fixed, "DV3", "tables/study1_dv3_fixed_effects.tex")
+save_coef_tex(table_DV3_coef, "DV3", "tables/study1_dv3_coefficients.tex")
+
+
+
+extract_contrasts <- function(model, dv_name) {
+  broom.mixed::tidy(model, effects = "fixed", conf.int = TRUE) %>%
+    filter(grepl("Group.*:timePost", term)) %>%
+    mutate(
+      DV          = dv_labels[[dv_name]],
+      Estimate    = estimate,
+      SE          = std.error,
+      t           = statistic,
+      CI_low      = conf.low,        # 95% Wald interval, unadjusted (as in Study 2)
+      CI_high     = conf.high,
+      p_two_sided = p.value,
+      p_one_sided = one_sided_p(p.value, estimate),
+      term        = relabel_term(term)
+    ) %>%
+    select(DV, term, Estimate, SE, t, CI_low, CI_high, p_two_sided, p_one_sided)
+}
+
+apply_holm <- function(df) {
+  df %>%
+    mutate(
+      p_holm_within_dv = p.adjust(p_one_sided, method = "holm"),
+      stars = case_when(
+        p_holm_within_dv < 0.001 ~ "***",
+        p_holm_within_dv < 0.01  ~ "**",
+        p_holm_within_dv < 0.05  ~ "*",
+        p_holm_within_dv < 0.10  ~ "+",
+        TRUE ~ ""
+      )
+    )
+}
+
+contr_DV1 <- apply_holm(extract_contrasts(lmm_DV1, "DV1"))
+contr_DV2 <- apply_holm(extract_contrasts(lmm_DV2, "DV2"))
+contr_DV3 <- apply_holm(extract_contrasts(lmm_DV3, "DV3"))
+
+print_contrast_table <- function(df, title) {
+  df %>%
+    mutate(
+      Estimate         = round(Estimate, 3),
+      SE               = round(SE, 3),
+      t                = round(t, 3),
+      p_holm_within_dv = round(p_holm_within_dv, 4)
+    ) %>%
+
+    select(DV, Term = term, Estimate, SE, t, p_holm_within_dv, stars) %>%
+    kable(digits = 3, caption = title) %>%
+    kable_styling(full_width = FALSE, position = "center")
+}
+
+print_contrast_table(contr_DV1, "DV1 (Perceptions): Primary One-Sided Contrasts (Holm-within-DV)")
+print_contrast_table(contr_DV2, "DV2 (Refugee Support): Primary One-Sided Contrasts (Holm-within-DV)")
+print_contrast_table(contr_DV3, "DV3 (Policy Endorsement): Primary One-Sided Contrasts (Holm-within-DV)")
+
+
+save_contrast_table_tex <- function(df, caption, label, file) {
+  df %>%
+    transmute(Term = term,
+              Estimate = sprintf("%.3f", Estimate), SE = sprintf("%.3f", SE), `$t$` = sprintf("%.3f", t),
+              `LB$_{95}$` = sprintf("%.3f", CI_low), `UB$_{95}$` = sprintf("%.3f", CI_high),
+              `$p_{\\mathrm{Holm}}$` = fmt_p3(p_holm_within_dv), Sig. = stars_tex(stars3(p_holm_within_dv))) %>%
+    kable(format = "latex", booktabs = TRUE, escape = FALSE, label = label, caption = caption) %>%
+    kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+    kableExtra::save_kable(file = file)
+}
+save_contrast_table_tex(contr_DV1, "Perceptions: confirmatory pre--post contrasts in Study~1 (Condition $\\times$ Post terms of the linear mixed-effects model; $p$ one-sided and Holm-corrected across the four contrasts; 95\\% confidence intervals two-sided and unadjusted). $^{\\dagger}p<.10$, $^{*}p<.05$, $^{**}p<.01$, $^{***}p<.001$.", "s1-dv1-conf", "tables/study1_dv1_contrasts.tex")
+save_contrast_table_tex(contr_DV2, "Refugee support: … (same caption) …", "s1-dv2-conf", "tables/study1_dv2_contrasts.tex")
+save_contrast_table_tex(contr_DV3, "Policy endorsement: … (same caption) …", "s1-dv3-conf", "tables/study1_dv3_contrasts.tex")
+
+
+
+```
+
+```{r between-intervention-change}
+# -----------------------------------------------------------------------------
+# Differences between interventions in pre-post change
+
+# -----------------------------------------------------------------------------
+pair_order <- c("self_reflection - debunking", "empathy - debunking",
+                "empathy - self_reflection",   "roleplay - debunking",
+                "roleplay - self_reflection",  "roleplay - empathy")
+
+between_intervention_change <- function(model, dv_key, holm_family = c("six", "ten")) {
+  holm_family <- match.arg(holm_family)
+  emm <- emmeans::emmeans(model, ~ Group * time)
+  # "revpairwise" on both factors gives (later level - earlier level) of
+  # (Post - Pre): a positive estimate means the first-named condition improved
+  # more. Factor order is neutral, debunking, self_reflection, empathy, roleplay.
+  ic  <- emmeans::contrast(emm, interaction = c(Group = "revpairwise", time = "revpairwise"))
+  tab <- as.data.frame(summary(ic, adjust = "none", infer = c(TRUE, TRUE), level = 0.95))
+  grp_col <- grep("^Group", names(tab), value = TRUE)
+  stopifnot(length(grp_col) == 1)
+  tab <- dplyr::rename(tab, pair = !!rlang::sym(grp_col))
+  if (holm_family == "six") tab <- dplyr::filter(tab, !grepl("neutral", pair))
+  tab <- dplyr::mutate(tab, p_holm = p.adjust(p.value, method = "holm"))
+  stopifnot(nrow(tab) == ifelse(holm_family == "six", 6L, 10L))
+
+  # Identity check: each estimate equals the difference of the two Group:timePost
+  # fixed effects (Neutral is the reference; its interaction coefficient is 0).
+  fe <- lme4::fixef(model)
+  coef_of <- function(g) if (g == "neutral") 0 else unname(fe[[paste0("Group", g, ":timePost")]])
+  lhs <- sub(" - .*$", "", tab$pair)
+  rhs <- sub("^.* - ", "", tab$pair)
+  expected <- mapply(function(a, b) coef_of(a) - coef_of(b), lhs, rhs)
+  stopifnot(isTRUE(all.equal(unname(expected), tab$estimate, tolerance = 1e-8)))
+
+  tab %>%
+    dplyr::arrange(match(pair, pair_order)) %>%
+    dplyr::transmute(
+      DV       = dv_labels[[dv_key]],
+      pair,
+      Contrast = relabel_groups_in_string(pair),
+      Estimate = estimate, SE, df, t = t.ratio,
+      p_holm, CI_low = lower.CL, CI_high = upper.CL,
+      stars    = stars3(p_holm)
+    )
+}
+
+bic_DV1 <- between_intervention_change(lmm_DV1, "DV1")
+bic_DV2 <- between_intervention_change(lmm_DV2, "DV2")
+bic_DV3 <- between_intervention_change(lmm_DV3, "DV3")
+
+# ---- inline display -----------------------------------------------------------
+show_bic <- function(tbl, dv_key) {
+  tbl %>%
+    dplyr::mutate(dplyr::across(c(Estimate, SE, t, CI_low, CI_high), ~ round(., 3)),
+                  df = round(df, 0), p_holm = round(p_holm, 4)) %>%
+    dplyr::select(Contrast, Estimate, SE, df, t, p_holm, CI_low, CI_high, stars) %>%
+    knitr::kable(caption = sprintf(
+      "%s: differences between interventions in pre-post change (Study %s; contrasts of the Condition x Time interaction; two-sided; Holm across the six intervention pairs; 95%% CIs unadjusted)",
+      dv_labels[[dv_key]], STUDY_NUM)) %>%
+    kableExtra::kable_styling(full_width = FALSE, position = "center")
+}
+show_bic(bic_DV1, "DV1"); show_bic(bic_DV2, "DV2"); show_bic(bic_DV3, "DV3")
+
+# ---- LaTeX export (Supplement F.3 / G.3) ------------------------------------
+export_bic <- function(tbl, dv_key) {
+  out <- tbl %>%
+    dplyr::transmute(
+      Contrast,
+      Estimate = sprintf("%.3f", Estimate), SE = sprintf("%.3f", SE),
+      df = sprintf("%.0f", df), t = sprintf("%.3f", t),
+      p_holm  = fmt_p3(p_holm),
+      CI_low  = sprintf("%.3f", CI_low), CI_high = sprintf("%.3f", CI_high),
+      stars   = stars_tex(stars))
+  knitr::kable(out, format = "latex", booktabs = TRUE, escape = FALSE,
+               label = sprintf("%s-%s-change", STUDY_TAG, tolower(dv_key)),   # -> \label{tab:s1-dv2-change}
+               col.names = c("Contrast", "Estimate", "SE", "$df$", "$t$",
+                             "$p_{\\mathrm{Holm}}$", "LB$_{95}$", "UB$_{95}$", "Sig."),
+               caption = sprintf(paste0(
+                 "%s: differences between interventions in pre--post change in Study~%s ",
+                 "(contrasts of the Condition $\\times$ Time interaction; two-sided; ",
+                 "Holm-corrected across the six intervention pairs; 95\\%% confidence intervals unadjusted). ",
+                 "$^{\\dagger}p<.10$, $^{*}p<.05$, $^{**}p<.01$, $^{***}p<.001$."),
+                 dv_labels[[dv_key]], STUDY_NUM)) %>%
+    kableExtra::kable_styling(full_width = FALSE, position = "center", latex_options = "scale_down") %>%
+    kableExtra::save_kable(file = sprintf("tables/study%s_%s_between_intervention_change.tex",
+                                          STUDY_NUM, tolower(dv_key)))
+}
+export_bic(bic_DV1, "DV1"); export_bic(bic_DV2, "DV2"); export_bic(bic_DV3, "DV3")
+
+# ---- manuscript-ready sentences (p.p. = 100 x estimate on the 0-1 scale) -----
+bic_sentence <- function(tbl) {
+  tbl %>%
+    dplyr::mutate(txt = sprintf("%s: %.1f p.p., 95%% CI [%.1f, %.1f], p_Holm %s",
+                                gsub("\\\\textsc\\{|\\}", "", Contrast),
+                                100 * Estimate, 100 * CI_low, 100 * CI_high, p_txt(p_holm))) %>%
+    dplyr::pull(txt)
+}
+cat(sprintf("\n=== Study %s: between-intervention differences in pre-post change ===\n", STUDY_NUM))
+for (k in c("DV1", "DV2", "DV3")) {
+  cat(dv_labels[[k]], "\n")
+  cat(paste0("  ", bic_sentence(get(paste0("bic_", k))), "\n"), sep = "")
+}
+
+bic_DV2_all10 <- between_intervention_change(lmm_DV2, "DV2", holm_family = "ten")
+```
+
+
+
+## Effect Sizes (Cohen's d for the treatment-vs-Neutral pre-post contrasts)
+
+
+
+```{r}
+make_cohens_d_table <- function(model, dv_name) {
+  vc       <- as.data.frame(VarCorr(model))
+  sd_total <- sqrt(sum(vc$vcov))
+  sd_resid <- sigma(model)
+  sd_pre   <- sd(filter(lmm_data, DV == dv_name, time == "Pre")$score,
+                 na.rm = TRUE)
+
+  broom.mixed::tidy(model, effects = "fixed") %>%
+    filter(grepl("^Group.*:timePost$", term)) %>%
+    transmute(
+      # Canonical DV label rather than the raw DV1/DV2/DV3 tag (dv_name is
+      # still used above, unmodified, to filter the raw lmm_data).
+      DV        = dv_labels[[dv_name]],
+      Contrast  = unname(group_display_labels[sub(":timePost", "", sub("^Group", "", term))]),
+      Estimate  = estimate,
+      d_pre_sd  = estimate / sd_pre,    # Morris (2008) d_ppc2 (primary)
+      d_total_sd = estimate / sd_total, # total person-level SD
+      d_resid_sd = estimate / sd_resid  # within-person (residual) SD
+    )
+}
+
+cohens_d_table <- bind_rows(
+  make_cohens_d_table(lmm_DV1, "DV1"),
+  make_cohens_d_table(lmm_DV2, "DV2"),
+  make_cohens_d_table(lmm_DV3, "DV3")
+)
+
+cohens_d_table %>%
+  mutate(across(where(is.numeric), ~ round(., 3))) %>%
+  kable(caption = "Cohen's d for the Group x timePost contrasts (primary: d_pre_sd = diff-in-diff / pooled pre-intervention SD, Morris 2008 d_ppc2)") %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+
+
+# Confirmatory Plots
+
+```{r}
+
+lmm_data <- lmm_data %>%
+  mutate(
+    score_original = case_when(
+      DV == "DV1" ~ score * 4 + 1,      # 0–1 → 1–5
+      DV == "DV2" ~ score * 100,        # 0–1 → 0–100
+      DV == "DV3" ~ score * 100,        # 0–1 → 0–100
+      TRUE ~ NA_real_
+    )
+  )
+
+library(tidyverse)
+library(lme4)
+library(patchwork)
+
+desired_order <- c("neutral", "self_reflection", "empathy", "roleplay", "debunking")  # Debunking moved to the end
+
+dv_scales <- list(
+  DV1 = c(1, 5),
+  DV2 = c(0, 100),
+  DV3 = c(0, 100)
+)
+
+dv_plot_labels <- list(
+  DV1 = "Perceptions",
+  DV2 = "Refugee Support",
+  DV3 = "Policy Endorsement"
+)
+
+facet_labels <- c(
+  neutral         = "Neutral",
+  self_reflection = "Interview",
+  empathy         = "Empathy",
+  roleplay        = "Roleplay",
+  debunking       = "Debunking"
+)
+
+plot_dv <- function(dv_name, show_n = FALSE) {
+  
+  df <- lmm_data %>%
+    filter(DV == dv_name) %>%
+    mutate(
+      Group_plot  = factor(Group, levels = desired_order),
+      time        = factor(time, levels = c("Pre", "Post")),
+      Group_model = relevel(factor(Group), ref = "neutral")
+    )
+  
+  sum_sub <- df %>%
+    group_by(Group_plot, time) %>%
+    summarise(
+      mean  = mean(score_original),
+      sd    = sd(score_original),
+      n     = n(),
+      se    = sd / sqrt(n),
+      lower = mean - 1.96 * se,
+      upper = mean + 1.96 * se,
+      .groups = "drop"
+    )
+  
+
+  if (show_n) {
+    n_lookup <- sum_sub %>%
+      filter(time == "Pre") %>%
+      select(Group_plot, n) %>%
+      deframe()
+    
+    facet_labels_use <- setNames(
+      paste0(facet_labels[names(facet_labels)],
+             "\n(n = ", n_lookup[names(facet_labels)], ")"),
+      names(facet_labels)
+    )
+  } else {
+    facet_labels_use <- facet_labels
+  }
+  
+  model <- lmer(score ~ Group_model * time + (1 | anon_id), data = df)
+  coefs <- summary(model)$coefficients
+  
+  # --- NON-NEUTRAL GROUPS: interaction terms ---
+  rows  <- grep("^Group_model.*:timePost$", rownames(coefs))
+  
+  sig_sub_nonneutral <- tibble(
+    Group_model = sub("Group_model", "", sub(":timePost", "", rownames(coefs)[rows])),
+    est         = coefs[rows, "Estimate"],
+    p_two       = coefs[rows, "Pr(>|t|)"]
+  ) %>%
+    mutate(
+      # Primary specification: one-sided p-values (H1: estimate > 0), Holm
+      # correction across the 4 treatment-vs-Neutral contrasts within this DV.
+      p_one            = one_sided_p(p_two, est),
+      p_holm_within_dv = p.adjust(p_one, method = "holm"),
+      Group_plot = factor(Group_model, levels = desired_order),
+      star = case_when(
+        p_holm_within_dv < 0.001 ~ "***",
+        p_holm_within_dv < 0.01  ~ "**",
+        p_holm_within_dv < 0.05  ~ "*",
+        p_holm_within_dv < 0.10  ~ "+",
+        TRUE ~ ""
+      ),
+      est_fmt = sprintf("%.3f", est),
+      p_fmt   = sprintf("%.3f", p_holm_within_dv),
+      label_expr = map2(
+        est_fmt, p_fmt,
+        ~ bquote(Delta == .( .x ) ~ "(" * italic(p) == .( .y ) * ")")
+      )
+    )
+  
+  # --- NEUTRAL GROUP: force Δ = 0 and p = 1 ---
+  neutral_row <- tibble(
+    Group_model      = "neutral",
+    est              = 0,
+    p_two            = 1,
+    p_one            = 1,
+    p_holm_within_dv = 1,
+    Group_plot       = factor("neutral", levels = desired_order),
+    star             = "",
+    est_fmt          = sprintf("%.3f", 0),
+    p_fmt            = sprintf("%.3f", 1),
+    label_expr  = map2(
+      est_fmt, p_fmt,
+      ~ bquote(Delta == .( .x ) ~ "(" * italic(p) == .( .y ) * ")")
+    )
+  )
+  
+  # combine neutral + non-neutral
+  sig_sub <- bind_rows(neutral_row, sig_sub_nonneutral)
+  
+  y_limits <- dv_scales[[dv_name]]
+  
+  cond_colors <- c(
+    "neutral.Pre"          = "#d9d9d9",
+    "neutral.Post"         = "#737373",
+    "self_reflection.Pre"  = "#a6cee3",
+    "self_reflection.Post" = "#1f78b4",
+    "empathy.Pre"          = "#fca5a5",
+    "empathy.Post"         = "#e31a1c",
+    "roleplay.Pre"         = "#b2df8a",
+    "roleplay.Post"        = "#33a02c",
+    "debunking.Pre"        = "#cfcfcf",
+    "debunking.Post"       = "#5f5f5f"
+  )
+  
+  ggplot(df, aes(x = time, y = score_original,
+                 fill = interaction(Group_plot, time))) +
+    
+    # LEFT SIDE: Replaced with ggdist::stat_slab
+    stat_slab(
+      data = df %>% filter(time == "Pre"),
+      side = "left", trim = TRUE, alpha = 0.85, color = NA
+    ) +
+    
+    # RIGHT SIDE: Replaced with ggdist::stat_slab
+    stat_slab(
+      data = df %>% filter(time == "Post"),
+      side = "right", trim = TRUE, alpha = 0.85, color = NA
+    ) + 
+    
+    geom_line(
+      data = sum_sub,
+      aes(y = mean, group = Group_plot),
+      linewidth = 1.1,
+      color = "black"
+    ) +
+    
+    geom_point(
+      data = sum_sub,
+      aes(y = mean),
+      size = 2.2,
+      color = "black"
+    ) +
+    
+    geom_errorbar(
+      data = sum_sub,
+      aes(ymin = lower, ymax = upper, y = mean),
+      width = 0.12,
+      linewidth = 0.4
+    ) +
+    
+    geom_text(
+      data = sig_sub,
+      aes(x = 1.5, y = Inf, label = star),
+      size = 5,
+      fontface = "bold",
+      vjust = 3,
+      inherit.aes = FALSE
+    ) +
+    
+    geom_text(
+      data = sig_sub,
+      aes(x = 1.5, y = Inf, label = label_expr),
+      parse = TRUE,
+      size = 3.2,
+      vjust = 1.4,
+      inherit.aes = FALSE
+    ) +
+    
+    facet_wrap(
+      ~ Group_plot,
+      nrow = 1,
+      labeller = labeller(Group_plot = facet_labels_use),
+      strip.position = "top"
+    ) +
+    
+    scale_fill_manual(values = cond_colors) +
+    labs(x = "", y = dv_plot_labels[[dv_name]]) +
+    
+    scale_y_continuous(
+      limits = y_limits,
+      expand = expansion(mult = c(0, 0.15))
+    ) +
+    
+    coord_cartesian(clip = "off") +
+    
+    theme_classic(base_size = 12) +
+    theme(
+      strip.background = element_blank(),
+      strip.placement = "outside",
+      strip.text = element_text(face = "bold", size = 11),
+      legend.position = "none",
+      axis.text.x = element_text(face = "bold"),
+      axis.line = element_line(color = "black", linewidth = 0.4),
+      panel.spacing = unit(0.1, "lines"),
+      plot.margin = margin(5, 5, 5, 5)
+    )
+}
+
+p1 <- plot_dv("DV1", show_n = TRUE)
+p2 <- plot_dv("DV2")
+p3 <- plot_dv("DV3")
+
+stacked <- p1 / p2 / p3 + plot_annotation(tag_levels = "a")
+
+ggsave("Confirmatory_Stacked_Figure.pdf", stacked, width = 10, height = 13)
+
+
+```
+
+
+
+
+
+# Additional comparison group: Static Information as reference category
+
+
+```{r}
+
+
+make_fixed_effects_table <- function(model) {
+  anova(model) %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("Effect") %>%
+    mutate(
+      F                = round(`F value`, 3),
+      # Omnibus F-tests are non-directional; no one-sided version exists.
+      # Only the Holm-corrected p-value is exposed in the table.
+      p_value_raw      = `Pr(>F)`,
+      p_holm_raw       = p.adjust(p_value_raw, method = "holm"),
+      p_holm_within_dv = sprintf("%.3f", p_holm_raw),
+      stars = case_when(
+        p_holm_raw < 0.001 ~ "***",
+        p_holm_raw < 0.01  ~ "**",
+        p_holm_raw < 0.05  ~ "*",
+        p_holm_raw < 0.10  ~ "+",
+        TRUE ~ ""
+      )
+    ) %>%
+    select(
+      Effect, NumDF, DenDF, F,
+      p_holm_within_dv, stars
+    )
+}
+
+
+term_labels_static <- c(
+  "(Intercept)"                   = "Intercept (\\textsc{Static~Information}, pre)",
+  "timePost"                      = "Post",
+  "Groupneutral"                  = "\\textsc{Neutral}",
+  "Groupdebunking"                = "\\textsc{Debunking}",
+  "Groupself_reflection"          = "\\textsc{Interview}",
+  "Groupempathy"                  = "\\textsc{Empathy}",
+  "Grouproleplay"                 = "\\textsc{Roleplay}",
+  "Groupneutral:timePost"         = "\\textsc{Neutral} \u00D7 Post",
+  "Groupdebunking:timePost"       = "\\textsc{Debunking} \u00D7 Post",
+  "Groupself_reflection:timePost" = "\\textsc{Interview} \u00D7 Post",
+  "Groupempathy:timePost"         = "\\textsc{Empathy} \u00D7 Post",
+  "Grouproleplay:timePost"        = "\\textsc{Roleplay} \u00D7 Post"
+)
+
+relabel_term_static <- function(term) {
+  out <- unname(term_labels_static[term])
+  out[is.na(out)] <- term[is.na(out)]
+  out
+}
+
+make_coef_table <- function(model) {
+  tidy(model, effects = "fixed", conf.int = TRUE) %>%
+    mutate(
+      is_contrast      = grepl("^Group.*:timePost$", term),
+      p_one_sided_raw  = one_sided_p(p.value, estimate),
+      p_holm_raw       = ifelse(is_contrast,
+                                p.adjust(ifelse(is_contrast, p_one_sided_raw, NA_real_), method = "holm"),
+                                NA_real_),
+      Estimate         = sprintf("%.3f", estimate),
+      SE               = sprintf("%.3f", std.error),
+      t                = sprintf("%.3f", statistic),
+      CI_low           = sprintf("%.3f", conf.low),
+      CI_high          = sprintf("%.3f", conf.high),
+      p_holm_within_dv = ifelse(is.na(p_holm_raw), "",
+                                ifelse(p_holm_raw < 0.001, "$<$0.001", sprintf("%.3f", p_holm_raw))),
+      stars = case_when(
+        !is.na(p_holm_raw) & p_holm_raw < 0.001 ~ "***",
+        !is.na(p_holm_raw) & p_holm_raw < 0.01  ~ "**",
+        !is.na(p_holm_raw) & p_holm_raw < 0.05  ~ "*",
+        !is.na(p_holm_raw) & p_holm_raw < 0.10  ~ "$\\dagger$",
+        TRUE ~ ""
+      ),
+      Term = relabel_term_static(term)
+    ) %>%
+    select(Term, Estimate, SE, t, CI_low, CI_high, p_holm_within_dv, stars)
+}
+
+
+
+data_static_ref <- data
+
+pre_long_static <- data_static_ref %>%
+  select(anon_id, Group, DV1_pre, DV2_pre, DV3_pre) %>%
+  pivot_longer(cols = starts_with("DV"), names_to = "DV", values_to = "score") %>%
+  mutate(time = "Pre")
+
+post_long_static <- data_static_ref %>%
+  select(anon_id, Group, DV1_post, DV2_post, DV3_post) %>%
+  pivot_longer(cols = starts_with("DV"), names_to = "DV", values_to = "score") %>%
+  mutate(
+    time = "Post",
+    DV = case_when(
+      DV == "DV1_post" ~ "DV1",
+      DV == "DV2_post" ~ "DV2",
+      DV == "DV3_post" ~ "DV3"
+    )
+  )
+
+lmm_data_static_ref <- bind_rows(
+  pre_long_static %>% mutate(DV = case_when(
+    DV == "DV1_pre" ~ "DV1",
+    DV == "DV2_pre" ~ "DV2",
+    DV == "DV3_pre" ~ "DV3"
+  )),
+  post_long_static
+) %>%
+  mutate(
+    time = factor(time, levels = c("Pre", "Post")),
+    Group = relevel(factor(Group), ref = "static_information")
+  )
+
+
+# FIT MODELS
+
+lmm_DV1_static <- lmer(score ~ Group * time + (1 | anon_id),
+                       data = filter(lmm_data_static_ref, DV == "DV1"))
+lmm_DV2_static <- lmer(score ~ Group * time + (1 | anon_id),
+                       data = filter(lmm_data_static_ref, DV == "DV2"))
+lmm_DV3_static <- lmer(score ~ Group * time + (1 | anon_id),
+                       data = filter(lmm_data_static_ref, DV == "DV3"))
+
+
+# TABLES
+
+table_DV1_fixed_static <- make_fixed_effects_table(lmm_DV1_static)
+table_DV1_coef_static  <- make_coef_table(lmm_DV1_static)
+
+table_DV2_fixed_static <- make_fixed_effects_table(lmm_DV2_static)
+table_DV2_coef_static  <- make_coef_table(lmm_DV2_static)
+
+table_DV3_fixed_static <- make_fixed_effects_table(lmm_DV3_static)
+table_DV3_coef_static  <- make_coef_table(lmm_DV3_static)
+
+
+# OUTPUT
+
+table_DV1_fixed_static %>% kable(digits = 3,
+  caption = "Perceptions: Fixed Effects (Static Information Reference, Holm-Corrected)") %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+table_DV1_coef_static %>% kable(digits = 3,
+  caption = "Perceptions: Coefficients (Static Information Reference, Holm-Corrected)",
+  escape = FALSE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+table_DV2_fixed_static %>% kable(digits = 3,
+  caption = "Refugee Support: Fixed Effects (Static Information Reference, Holm-Corrected)") %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+table_DV2_coef_static %>% kable(digits = 3,
+  caption = "Refugee Support: Coefficients (Static Information Reference, Holm-Corrected)",
+  escape = FALSE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+table_DV3_fixed_static %>% kable(digits = 3,
+  caption = "Policy Endorsement: Fixed Effects (Static Information Reference, Holm-Corrected)") %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+table_DV3_coef_static %>% kable(digits = 3,
+  caption = "Policy Endorsement: Coefficients (Static Information Reference, Holm-Corrected)",
+  escape = FALSE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+
+save_fixed_effects_tex_static <- function(tbl, dv_key, file) {
+  tbl %>%
+    kable(
+      digits = 3,
+      caption = paste0(dv_labels[[dv_key]], " (", dv_key, "): Omnibus Fixed-Effects (Type III) Tests, Static Information Reference"),
+      format = "latex",
+      booktabs = TRUE
+    ) %>%
+    kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+    kableExtra::save_kable(file = file)
+}
+
+save_coef_tex_static <- function(tbl, dv_key, study_num, file) {
+  stopifnot(identical(names(tbl), c("Term", "Estimate", "SE", "t", "CI_low", "CI_high", "p_holm_within_dv", "stars")))
+  tbl %>%
+    kable(format = "latex", booktabs = TRUE, escape = FALSE,
+          label = sprintf("s%s-%s-static", study_num, tolower(dv_key)),
+          col.names = c("Term", "Estimate", "SE", "$t$", "LB$_{95}$", "UB$_{95}$", "$p_{\\mathrm{Holm}}$", "Sig."),
+          caption = sprintf(paste0(
+            "%s: robustness coefficients in Study~%s (linear mixed-effects model with \\textsc{Static Information} ",
+            "as the reference condition; 95\\%% confidence intervals unadjusted; $p$ one-sided and Holm-corrected across ",
+            "the five Condition $\\times$ Post contrasts and reported for those contrasts only). ",
+            "$^{\\dagger}p<.10$, $^{*}p<.05$, $^{**}p<.01$, $^{***}p<.001$."), dv_labels[[dv_key]], study_num)) %>%
+    kableExtra::kable_styling(full_width = FALSE, position = "center", latex_options = "scale_down") %>%
+    kableExtra::save_kable(file = file)
+}
+
+save_fixed_effects_tex_static(table_DV1_fixed_static, "DV1", "tables/study1_dv1_fixed_effects_static_ref.tex")
+save_coef_tex_static(table_DV1_coef_static, "DV1", "1", "tables/study1_dv1_coefficients_static_ref.tex")
+
+save_fixed_effects_tex_static(table_DV2_fixed_static, "DV2", "tables/study1_dv2_fixed_effects_static_ref.tex")
+save_coef_tex_static(table_DV2_coef_static, "DV2", "1", "tables/study1_dv2_coefficients_static_ref.tex")
+
+save_fixed_effects_tex_static(table_DV3_fixed_static, "DV3", "tables/study1_dv3_fixed_effects_static_ref.tex")
+save_coef_tex_static(table_DV3_coef_static, "DV3", "1", "tables/study1_dv3_coefficients_static_ref.tex")
+
+
+
+```
+
+
+
+# Exploratory Analyses
+
+## Demographics
+
+### Demographics cleaning
+
+```{r}
+data <- data %>%
+  mutate(
+    # age: collapse into 3 groups + unknown
+    age3 = case_when(
+      age %in% c("18-24", "25-34") ~ "young",
+      age %in% c("35-44", "45-54") ~ "middle",
+      age %in% c("55-64", "65 or older") ~ "older",
+      TRUE ~ "unknown"
+    ),
+    age3 = factor(age3, levels = c("young", "middle", "older", "unknown")),
+
+    # gender: collapse tiny categories
+    gender3 = case_when(
+      gender == "Male" ~ "Male",
+      gender == "Female" ~ "Female",
+      TRUE ~ "Other"
+    ),
+    gender3 = factor(gender3, levels = c("Male", "Female", "Other")),
+
+    # employment: collapse multi-select chaos
+    employment3 = case_when(
+      grepl("full-time", employment, ignore.case = TRUE) ~ "Full-time",
+      grepl("part-time|student", employment, ignore.case = TRUE) ~ "Part-time/Student",
+      TRUE ~ "Other/Not working"
+    ),
+    employment3 = factor(
+      employment3,
+      levels = c("Full-time", "Part-time/Student", "Other/Not working")
+    ),
+
+    # children: binary
+    children_bin = ifelse(children == "0", "No children", "Has children"),
+    children_bin = factor(children_bin, levels = c("No children", "Has children")),
+
+    # economic situation: keep as is
+    economic_situation = factor(
+      economic_situation,
+      levels = c("Low income", "Middle income", "High income", "Prefer not to say")
+    ),
+
+    # religion: collapse into 3 groups
+    religion3 = case_when(
+      religion == "No religious affiliation" ~ "None",
+      religion == "Christianity" ~ "Christian",
+      TRUE ~ "Other"
+    ),
+    religion3 = factor(religion3, levels = c("None", "Christian", "Other")),
+
+    # migration background: keep as is
+    migration_background = factor(
+      migration_background,
+      levels = c("Yes", "No", "Prefer not to say")
+    ),
+
+    # sliders: numeric + z-score
+    contact_1 = as.numeric(gsub(",", ".", contact_1)),
+    political_view_1 = as.numeric(gsub(",", ".", political_view_1)),
+    contact_1_z = as.numeric(scale(contact_1)),
+    political_view_1_z = as.numeric(scale(political_view_1))
+  )
+
+# Quick summaries
+summary(data$age3)
+summary(data$gender3)
+summary(data$employment3)
+summary(data$children_bin)
+summary(data$religion3)
+```
+
+### Demographics overview
+
+```{r}
+data_demo <- data
+
+# Display labels (no internal coding suffixes like "3" / "_bin")
+demo_var_labels <- c(
+  age3 = "Age",
+  gender3 = "Gender",
+  employment3 = "Employment",
+  children_bin = "Children",
+  economic_situation = "Economic situation",
+  religion3 = "Religion",
+  migration_background = "Migration background"
+)
+cat_vars <- names(demo_var_labels)
+
+# Italic *n* in column headers (HTML vs LaTeX)
+n_header <- if (isTRUE(knitr::is_latex_output())) "$n$" else "<i>n</i>"
+n_header_tex <- "$n$"
+
+# Ensure tables/ exists for .tex exports (same structure as Study 2)
+if (!dir.exists("tables")) {
+  dir.create("tables")
+}
+
+# Capitalize a few collapsed age labels for display
+pretty_demo_category <- function(x) {
+  dplyr::recode(
+    as.character(x),
+    young = "Young",
+    middle = "Middle",
+    older = "Older",
+    unknown = "Unknown",
+    .default = as.character(x)
+  )
+}
+
+# Categorical summary table
+cat_table <- purrr::map_dfr(cat_vars, function(v) {
+  data_demo %>%
+    janitor::tabyl(!!sym(v)) %>%
+    rename(Category = !!sym(v)) %>%
+    mutate(
+      Variable = unname(demo_var_labels[v]),
+      Category = pretty_demo_category(Category),
+      # tabyl stores a proportion in `percent`; report as % of analytic sample
+      Percent = percent * 100
+    ) %>%
+    select(Variable, Category, n, Percent)
+})
+
+# Show each variable name once; blank in subsequent rows
+cat_table_display <- cat_table %>%
+  mutate(Variable = ifelse(duplicated(Variable), "", Variable))
+
+# Horizontal rules between variable blocks
+cat_hline_after <- which(cat_table_display$Variable != "")[-1] - 1
+
+cat_table_kbl <- cat_table_display %>%
+  kable(
+    caption = "Demographic characteristics of the sample (categorical variables). Percent is the share of the analytic sample.",
+    digits = 1,
+    col.names = c("Variable", "Category", n_header_tex, "Percent"),
+    escape = FALSE,
+    align = c("l", "l", "r", "r"),
+    format = "latex",
+    booktabs = TRUE
+  ) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+  kableExtra::row_spec(cat_hline_after, hline_after = TRUE)
+
+kableExtra::save_kable(
+  cat_table_kbl,
+  file = "tables/study1_demographics_categorical.tex"
+)
+
+# Also render for the HTML document
+cat_table_display %>%
+  kable(
+    caption = "Demographic characteristics of the sample (categorical variables). Percent is the share of the analytic sample.",
+    digits = 1,
+    col.names = c("Variable", "Category", n_header, "Percent"),
+    escape = FALSE,
+    align = c("l", "l", "r", "r"),
+    booktabs = TRUE
+  ) %>%
+  kable_styling(full_width = FALSE, position = "center") %>%
+  row_spec(cat_hline_after, extra_css = "border-bottom: 1px solid #999;")
+
+# Continuous summary table (Mean / SD columns; clear variable names)
+cont_table <- tibble::tibble(
+  Variable = c(
+    "Contact with refugees (0 = Never, 100 = Very often)",
+    "Political views on economic issues (0 = Very liberal, 100 = Very conservative)"
+  ),
+  Mean = c(
+    mean(data_demo$contact_1, na.rm = TRUE),
+    mean(data_demo$political_view_1, na.rm = TRUE)
+  ),
+  SD = c(
+    sd(data_demo$contact_1, na.rm = TRUE),
+    sd(data_demo$political_view_1, na.rm = TRUE)
+  )
+)
+
+cont_table_kbl <- cont_table %>%
+  kable(
+    caption = "Continuous demographics of the sample (contact and political views).",
+    digits = 2,
+    col.names = c("Variable", "Mean", "SD"),
+    align = c("l", "r", "r"),
+    format = "latex",
+    booktabs = TRUE
+  ) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center")
+
+kableExtra::save_kable(
+  cont_table_kbl,
+  file = "tables/study1_demographics_continuous.tex"
+)
+
+cont_table %>%
+  kable(
+    caption = "Continuous demographics of the sample (contact and political views).",
+    digits = 2,
+    col.names = c("Variable", "Mean", "SD"),
+    align = c("l", "r", "r"),
+    booktabs = TRUE
+  ) %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+# Demographics per condition
+table(data_demo$Group, data_demo$gender3)
+
+# Plots
+ggplot(data_demo, aes(x = age3)) +
+  geom_bar(fill = "#4C72B0") +
+  labs(title = "Age Distribution", x = "Age Group", y = "Count") +
+  theme_minimal()
+
+ggplot(data_demo, aes(x = gender3)) +
+  geom_bar(fill = "#C44E52") +
+  labs(title = "Gender Distribution", x = "Gender", y = "Count") +
+  theme_minimal()
+
+ggplot(data_demo, aes(x = employment3)) +
+  geom_bar(fill = "#55A868") +
+  labs(title = "Employment Status", x = "Employment", y = "Count") +
+  theme_minimal()
+
+ggplot(data_demo, aes(x = children_bin)) +
+  geom_bar(fill = "#8172B2") +
+  labs(title = "Parental Status", x = "Children", y = "Count") +
+  theme_minimal()
+
+ggplot(data_demo, aes(x = education)) +
+  geom_bar(fill = "#8172B2") +
+  labs(title = "Education Levels", x = "Education", y = "Count") +
+  theme_minimal() +
+  coord_flip()
+
+ggplot(data_demo, aes(x = political_view_1)) +
+  geom_density(fill = "#55A868", alpha = 0.6) +
+  labs(
+    title = "Political Orientation Distribution",
+    x = "Political Orientation (0 = Left, 100 = Right)",
+    y = "Density"
+  ) +
+  theme_minimal()
+
+##demogrpahic balance across conditions
+# chi square test for cat variables
+chisq.test(table(data_demo$Group, data_demo$gender3))
+chisq.test(table(data_demo$Group, data_demo$age3))
+chisq.test(table(data_demo$Group, data_demo$religion3))
+
+# anova for continuous variables
+summary(aov(contact_1 ~ Group, data = data_demo))
+summary(aov(political_view_1 ~ Group, data = data_demo))
+
+# demographics by condition table
+demo_by_group <- purrr::map_dfr(cat_vars, function(v) {
+  tab <- data_demo %>%
+    janitor::tabyl(Group, !!sym(v))
+
+  tab_pct <- tab %>%
+    janitor::adorn_percentages("row") %>%
+    janitor::adorn_pct_formatting()
+
+  tab %>%
+    pivot_longer(-Group, names_to = "Category", values_to = "n") %>%
+    left_join(
+      tab_pct %>% pivot_longer(-Group, names_to = "Category", values_to = "Percent"),
+      by = c("Group", "Category")
+    ) %>%
+    mutate(
+      Variable = unname(demo_var_labels[v]),
+      Category = pretty_demo_category(Category)
+    ) %>%
+    select(Variable, Category, Group, n, Percent)
+})
+
+demo_by_group_display <- demo_by_group %>%
+  mutate(Variable = ifelse(duplicated(Variable), "", Variable))
+
+demo_hline_after <- which(demo_by_group_display$Variable != "")[-1] - 1
+
+demo_by_group_kbl <- demo_by_group_display %>%
+  kable(
+    caption = "Demographic characteristics by experimental condition. Percent is the within-condition share.",
+    digits = 2,
+    col.names = c("Variable", "Category", "Group", n_header_tex, "Percent"),
+    escape = FALSE,
+    align = c("l", "l", "l", "r", "r"),
+    format = "latex",
+    booktabs = TRUE
+  ) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+  kableExtra::row_spec(demo_hline_after, hline_after = TRUE)
+
+kableExtra::save_kable(
+  demo_by_group_kbl,
+  file = "tables/study1_demographics_by_condition.tex"
+)
+
+demo_by_group_display %>%
+  kable(
+    caption = "Demographic characteristics by experimental condition. Percent is the within-condition share.",
+    digits = 2,
+    col.names = c("Variable", "Category", "Group", n_header, "Percent"),
+    escape = FALSE,
+    align = c("l", "l", "l", "r", "r"),
+    booktabs = TRUE
+  ) %>%
+  kable_styling(full_width = FALSE, position = "center") %>%
+  row_spec(demo_hline_after, extra_css = "border-bottom: 1px solid #999;")
+
+
+```
+
+
+
+## Pairwise comparisons among treatment conditions
+
+```{r}
+
+
+make_pairwise_table <- function(df, facet = c("none", "time", "group")) {
+  facet <- match.arg(facet)
+
+  out <- df %>%
+    as.data.frame() %>%
+    mutate(
+      p_one_raw        = one_sided_p(p.value, estimate),
+      p_holm_within_dv = p.adjust(p_one_raw, method = "holm"),
+      Contrast         = relabel_groups_in_string(contrast),
+      stars = case_when(
+        p_holm_within_dv < 0.001 ~ "***",
+        p_holm_within_dv < 0.01  ~ "**",
+        p_holm_within_dv < 0.05  ~ "*",
+        p_holm_within_dv < 0.10  ~ "+",
+        TRUE ~ ""
+      ),
+      Estimate         = sprintf("%.3f", estimate),
+      SE               = sprintf("%.3f", SE),
+      df               = sprintf("%.1f", df),
+      t                = sprintf("%.3f", t.ratio),
+      p_holm_within_dv = sprintf("%.3f", p_holm_within_dv)
+    )
+
+  if (facet == "time") {
+    out <- out %>% mutate(Time = as.character(time))
+    out %>% select(Time, Contrast, Estimate, SE, df, t, p_holm_within_dv, stars)
+  } else if (facet == "group") {
+    out <- out %>% mutate(Group = unname(group_display_labels[as.character(Group)]))
+    out %>% select(Group, Contrast, Estimate, SE, df, t, p_holm_within_dv, stars)
+  } else {
+    out %>% select(Contrast, Estimate, SE, df, t, p_holm_within_dv, stars)
+  }
+}
+
+save_pairwise_table_tex <- function(tbl, caption, file) {
+  tbl %>%
+    kable(
+      digits = 3,
+      caption = caption,
+      format = "latex",
+      booktabs = TRUE,
+      escape = FALSE
+    ) %>%
+    kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+    kableExtra::save_kable(file = file)
+}
+
+
+
+# DV1
+emm_DV1_simple <- emmeans(lmm_DV1, ~ Group | time)
+DV1_simple_pairs <- pairs(emm_DV1_simple, reverse = TRUE, adjust = "none")  # raw p-values
+
+tbl_DV1_pairwise_simple <- make_pairwise_table(DV1_simple_pairs, facet = "time")
+tbl_DV1_pairwise_simple %>%
+  kable(
+    caption = "Perceptions: Pairwise Comparisons of Group Differences at Pre and Post (Holm-Corrected)",
+    digits = 3
+  ) %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+# DV2
+emm_DV2_simple <- emmeans(lmm_DV2, ~ Group | time)
+DV2_simple_pairs <- pairs(emm_DV2_simple, reverse = TRUE, adjust = "none")
+
+tbl_DV2_pairwise_simple <- make_pairwise_table(DV2_simple_pairs, facet = "time")
+tbl_DV2_pairwise_simple %>%
+  kable(
+    caption = "Refugee Support: Pairwise Comparisons of Group Differences at Pre and Post (Holm-Corrected)",
+    digits = 3
+  ) %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+# DV3
+emm_DV3_simple <- emmeans(lmm_DV3, ~ Group | time)
+DV3_simple_pairs <- pairs(emm_DV3_simple, reverse = TRUE, adjust = "none")
+
+tbl_DV3_pairwise_simple <- make_pairwise_table(DV3_simple_pairs, facet = "time")
+tbl_DV3_pairwise_simple %>%
+  kable(
+    caption = "Policy Endorsement: Pairwise Comparisons of Group Differences at Pre and Post (Holm-Corrected)",
+    digits = 3
+  ) %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+save_pairwise_table_tex(tbl_DV1_pairwise_simple, "Perceptions: Pairwise Comparisons of Group Differences at Pre and Post (Holm-Corrected)", "tables/study1_dv1_pairwise_group_diff.tex")
+save_pairwise_table_tex(tbl_DV2_pairwise_simple, "Refugee Support: Pairwise Comparisons of Group Differences at Pre and Post (Holm-Corrected)", "tables/study1_dv2_pairwise_group_diff.tex")
+save_pairwise_table_tex(tbl_DV3_pairwise_simple, "Policy Endorsement: Pairwise Comparisons of Group Differences at Pre and Post (Holm-Corrected)", "tables/study1_dv3_pairwise_group_diff.tex")
+
+
+# CHANGE OVER TIME: WHICH GROUPS CHANGE MORE?
+
+# DV1
+emm_DV1_change <- emmeans(lmm_DV1, ~ Group * time)
+DV1_change_pairs <- contrast(
+  emm_DV1_change,
+  method = "revpairwise",
+  by = "Group",
+  adjust = "none"
+)
+
+tbl_DV1_pairwise_change <- make_pairwise_table(DV1_change_pairs, facet = "group")
+tbl_DV1_pairwise_change %>%
+  kable(
+    caption = "Perceptions: Pairwise Comparisons of Pre–Post Change (Holm-Corrected)",
+    digits = 3
+  ) %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+# DV2
+emm_DV2_change <- emmeans(lmm_DV2, ~ Group * time)
+DV2_change_pairs <- contrast(
+  emm_DV2_change,
+  method = "revpairwise",
+  by = "Group",
+  adjust = "none"
+)
+
+tbl_DV2_pairwise_change <- make_pairwise_table(DV2_change_pairs, facet = "group")
+tbl_DV2_pairwise_change %>%
+  kable(
+    caption = "Refugee Support: Pairwise Comparisons of Pre–Post Change (Holm-Corrected)",
+    digits = 3
+  ) %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+# DV3
+emm_DV3_change <- emmeans(lmm_DV3, ~ Group * time)
+DV3_change_pairs <- contrast(
+  emm_DV3_change,
+  method = "revpairwise",
+  by = "Group",
+  adjust = "none"
+)
+
+tbl_DV3_pairwise_change <- make_pairwise_table(DV3_change_pairs, facet = "group")
+tbl_DV3_pairwise_change %>%
+  kable(
+    caption = "Policy Endorsement: Pairwise Comparisons of Pre–Post Change (Holm-Corrected)",
+    digits = 3
+  ) %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+save_pairwise_table_tex(tbl_DV1_pairwise_change, "Perceptions: Pairwise Comparisons of Pre-Post Change (Holm-Corrected)", "tables/study1_dv1_pairwise_change.tex")
+save_pairwise_table_tex(tbl_DV2_pairwise_change, "Refugee Support: Pairwise Comparisons of Pre-Post Change (Holm-Corrected)", "tables/study1_dv2_pairwise_change.tex")
+save_pairwise_table_tex(tbl_DV3_pairwise_change, "Policy Endorsement: Pairwise Comparisons of Pre-Post Change (Holm-Corrected)", "tables/study1_dv3_pairwise_change.tex")
+
+
+
+```
+
+
+
+## Bot-Perception analysis
+
+```{r}
+# CONDITION COLORS
+condition_colors <- c(
+  neutral         = "#737373",
+  debunking       = "#5f5f5f",
+  self_reflection = "#1f78b4",
+  empathy         = "#e31a1c",
+  roleplay        = "#33a02c"
+)
+
+
+desired_order <- treatment_order
+
+
+# DATA PREP
+
+data_perc <- data %>%
+  filter(Group != "static_information") %>%
+  mutate(
+    Group = droplevels(Group),
+    bot_perception_1 = as.numeric(bot_perception_1),
+    bot_perception_2 = as.numeric(bot_perception_2),
+    bot_perception_3 = as.numeric(bot_perception_3),
+    perceived_empathy    = bot_perception_1 / 100,
+    perceived_pleasure   = bot_perception_2 / 100,
+    perceived_reflection = bot_perception_3 / 100,
+    bot_perception_1_01  = perceived_empathy,
+    bot_perception_2_01  = perceived_pleasure,
+    bot_perception_3_01  = perceived_reflection
+  )
+
+
+# DESCRIPTIVE STATISTICS
+
+perception_desc <- data_perc %>% 
+  group_by(Group) %>% 
+  summarise(
+    n = n(),
+    mean_empathy = mean(bot_perception_1_01, na.rm = TRUE),
+    sd_empathy = sd(bot_perception_1_01, na.rm = TRUE),
+    mean_pleasure = mean(bot_perception_2_01, na.rm = TRUE),
+    sd_pleasure = sd(bot_perception_2_01, na.rm = TRUE),
+    mean_reflection = mean(bot_perception_3_01, na.rm = TRUE),
+    sd_reflection = sd(bot_perception_3_01, na.rm = TRUE)
+  )
+
+perception_desc %>% 
+  kable(digits = 3,
+        caption = "Bot-Perception Scores by Condition (chatbot conditions only; Static Information held out)") %>% 
+  kable_styling(full_width = FALSE)
+
+
+# MEANS + SEs
+
+perc_summary <- data_perc %>%
+  group_by(Group) %>%
+  summarise(
+    empathy_mean = mean(bot_perception_1_01, na.rm = TRUE),
+    empathy_se   = sd(bot_perception_1_01, na.rm = TRUE) / sqrt(n()),
+    pleasure_mean = mean(bot_perception_2_01, na.rm = TRUE),
+    pleasure_se   = sd(bot_perception_2_01, na.rm = TRUE) / sqrt(n()),
+    reflection_mean = mean(bot_perception_3_01, na.rm = TRUE),
+    reflection_se   = sd(bot_perception_3_01, na.rm = TRUE) / sqrt(n())
+  )
+
+
+# BARPLOTS 
+
+ggplot(perc_summary, aes(x = Group, y = empathy_mean, fill = Group)) +
+  geom_col() +
+  scale_fill_manual(values = condition_colors) +
+  geom_errorbar(aes(ymin = empathy_mean - empathy_se,
+                    ymax = empathy_mean + empathy_se),
+                width = .2) +
+  labs(title = "Perceived Empathy by Condition",
+       x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggplot(perc_summary, aes(x = Group, y = pleasure_mean, fill = Group)) +
+  geom_col() +
+  scale_fill_manual(values = condition_colors) +
+  geom_errorbar(aes(ymin = pleasure_mean - pleasure_se,
+                    ymax = pleasure_mean + pleasure_se),
+                width = .2) +
+  labs(title = "Perceived Pleasure by Condition",
+       x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggplot(perc_summary, aes(x = Group, y = reflection_mean, fill = Group)) +
+  geom_col() +
+  scale_fill_manual(values = condition_colors) +
+  geom_errorbar(aes(ymin = reflection_mean - reflection_se,
+                    ymax = reflection_mean + reflection_se),
+                width = .2) +
+  labs(title = "Perceived Reflection by Condition",
+       x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+
+# SINGLE BOXPLOTS 
+
+ggplot(data_perc, aes(x = Group, y = bot_perception_1_01, fill = Group)) +
+  geom_boxplot() +
+  scale_fill_manual(values = condition_colors) +
+  labs(title = "Empathy Ratings by Condition",
+       x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggplot(data_perc, aes(x = Group, y = bot_perception_2_01, fill = Group)) +
+  geom_boxplot() +
+  scale_fill_manual(values = condition_colors) +
+  labs(title = "Pleasure Ratings by Condition",
+       x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggplot(data_perc, aes(x = Group, y = bot_perception_3_01, fill = Group)) +
+  geom_boxplot() +
+  scale_fill_manual(values = condition_colors) +
+  labs(title = "Reflection Ratings by Condition",
+       x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+
+# FACETED PLOT 
+
+
+data_long <- data_perc %>%
+  mutate(
+    Group = factor(Group, levels = treatment_order)
+  ) %>%
+  select(Group,
+         Empathy    = bot_perception_1_01,
+         Pleasure   = bot_perception_2_01,
+         Reflection = bot_perception_3_01) %>%
+  pivot_longer(cols = c(Empathy, Pleasure, Reflection),
+               names_to = "dimension",
+               values_to = "score")
+
+# facet labels bold
+facet_labels <- c(
+  "Empathy"    = "**Empathy**",
+  "Pleasure"   = "**Pleasure**",
+  "Reflection" = "**Reflection**"
+)
+
+ggplot(data_long, aes(x = Group, y = score, fill = Group)) +
+  geom_boxplot() +
+  facet_wrap(~ dimension, ncol = 1,
+             labeller = labeller(dimension = facet_labels)) +
+  scale_fill_manual(values = condition_colors) +
+  scale_x_discrete(labels = condition_labels) +
+  labs(
+       x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(
+    strip.text = ggtext::element_markdown(size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+
+# REGRESSIONS 
+
+model_perc_empathy <- lm(bot_perception_1_01 ~ Group, data = data_perc)
+summary(model_perc_empathy)
+
+emm_perc_empathy <- emmeans(model_perc_empathy, ~ Group)
+emm_perc_empathy %>%
+  kable(digits = 3,
+        caption = "Estimated Marginal Means for Perceived Empathy (chatbot conditions only)") %>%
+  kable_styling(full_width = FALSE)
+
+contrast(emm_perc_empathy, method = "pairwise", adjust = "holm") %>%
+  kable(digits = 3,
+        caption = "Pairwise Contrasts for Perceived Empathy (chatbot conditions only)") %>%
+  kable_styling(full_width = FALSE)
+
+model_perc_pleasure <- lm(bot_perception_2_01 ~ Group, data = data_perc)
+summary(model_perc_pleasure)
+
+emm_perc_pleasure <- emmeans(model_perc_pleasure, ~ Group)
+emm_perc_pleasure %>%
+  kable(digits = 3,
+        caption = "Estimated Marginal Means for Perceived Pleasure (chatbot conditions only)") %>%
+  kable_styling(full_width = FALSE)
+
+contrast(emm_perc_pleasure, method = "pairwise", adjust = "holm") %>%
+  kable(digits = 3,
+        caption = "Pairwise Contrasts for Perceived Pleasure (chatbot conditions only)") %>%
+  kable_styling(full_width = FALSE)
+
+model_perc_reflection <- lm(bot_perception_3_01 ~ Group, data = data_perc)
+summary(model_perc_reflection)
+
+emm_perc_reflection <- emmeans(model_perc_reflection, ~ Group)
+emm_perc_reflection %>%
+  kable(digits = 3,
+        caption = "Estimated Marginal Means for Perceived Reflection (chatbot conditions only)") %>%
+  kable_styling(full_width = FALSE)
+
+contrast(emm_perc_reflection, method = "pairwise", adjust = "holm") %>%
+  kable(digits = 3,
+        caption = "Pairwise Contrasts for Perceived Reflection (chatbot conditions only)") %>%
+  kable_styling(full_width = FALSE)
+
+```
+
+```{r botperception-export}
+
+
+if (!dir.exists("tables")) dir.create("tables")
+
+bp_dims <- tibble::tribble(
+  ~dim,         ~var,                  ~label,
+  "empathy",    "bot_perception_1_01", "Perceived Empathy",
+  "pleasure",   "bot_perception_2_01", "Perceived Pleasure",
+  "reflection", "bot_perception_3_01", "Perceived Reflection"
+)
+
+# Same three models as above, same 0-1 items, no covariates.
+model_perc_empathy    <- lm(bot_perception_1_01 ~ Group, data = data_perc)
+model_perc_pleasure   <- lm(bot_perception_2_01 ~ Group, data = data_perc)
+model_perc_reflection <- lm(bot_perception_3_01 ~ Group, data = data_perc)
+
+bp_models <- list(empathy    = model_perc_empathy,
+                  pleasure   = model_perc_pleasure,
+                  reflection = model_perc_reflection)
+bp_emms  <- lapply(bp_models, function(m) emmeans(m, ~ Group))
+# adjust = "holm" on the default two-sided pairwise contrasts.
+bp_pairs <- lapply(bp_emms, function(e) contrast(e, method = "pairwise", adjust = "holm"))
+
+bp_label <- function(suffix) paste0(STUDY_TAG, "-bp-", suffix)
+bp_note  <- paste("Items are rescaled to 0--1. Static Information is held out because",
+                  "participants in that condition did not interact with a chatbot.")
+
+# DESCRIPTIVES -> tables/study1_botperception_descriptives.tex
+bp_desc_tbl <- perception_desc %>%
+  mutate(Group = factor(as.character(Group), levels = treatment_order)) %>%
+  arrange(Group) %>%
+  transmute(
+    Condition  = unname(group_display_labels[as.character(Group)]),
+    n          = as.integer(n),
+    Empathy    = sprintf("%.3f (%.3f)", mean_empathy, sd_empathy),
+    Pleasure   = sprintf("%.3f (%.3f)", mean_pleasure, sd_pleasure),
+    Reflection = sprintf("%.3f (%.3f)", mean_reflection, sd_reflection)
+  )
+
+bp_desc_tbl %>%
+  kable(format = "latex", booktabs = TRUE, escape = FALSE,
+        label = bp_label("desc"),
+        align = c("l", "r", "r", "r", "r"),
+        col.names = c("Condition", "$n$", "Empathy", "Pleasure", "Reflection"),
+        caption = paste("Study 1 manipulation check: bot-perception ratings by condition,",
+                        "reported as $M$ ($SD$).", bp_note)) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+  kableExtra::save_kable(file = "tables/study1_botperception_descriptives.tex")
+
+# OMNIBUS F-TESTS -> tables/study1_botperception_omnibus.tex
+# eta^2 = SS_Group / SS_total, which for these one-way models equals R^2.
+bp_omnibus_tbl <- dplyr::bind_rows(lapply(bp_dims$dim, function(d) {
+  a <- anova(bp_models[[d]])
+  tibble::tibble(
+    Dimension = bp_dims$label[bp_dims$dim == d],
+    df1  = a["Group", "Df"],
+    df2  = a["Residuals", "Df"],
+    Fval = a["Group", "F value"],
+    eta2 = a["Group", "Sum Sq"] / sum(a[, "Sum Sq"]),
+    pval = a["Group", "Pr(>F)"]
+  )
+})) %>%
+  transmute(
+    Dimension,
+    df1   = sprintf("%d", as.integer(df1)),
+    df2   = sprintf("%d", as.integer(df2)),
+    F     = sprintf("%.3f", Fval),
+    eta2  = sprintf("%.3f", eta2),
+    p     = fmt_p3(pval),
+    stars = stars_tex(stars3(pval))
+  )
+
+bp_omnibus_tbl %>%
+  kable(format = "latex", booktabs = TRUE, escape = FALSE,
+        label = bp_label("omnibus"),
+        align = c("l", "r", "r", "r", "r", "r", "l"),
+        col.names = c("Dimension", "$df_1$", "$df_2$", "$F$", "$\\eta^2$", "$p$", ""),
+        caption = paste("Study 1 manipulation check: omnibus tests of the condition effect on each",
+                        "bot-perception dimension.", bp_note)) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+  kableExtra::save_kable(file = "tables/study1_botperception_omnibus.tex")
+
+# PER-DIMENSION EMMEANS AND TWO-SIDED HOLM PAIRWISE CONTRASTS
+bp_emm_tbl <- function(emm) {
+  as.data.frame(emm) %>%
+    mutate(Group = factor(as.character(Group), levels = treatment_order)) %>%
+    arrange(Group) %>%
+    transmute(
+      Condition = unname(group_display_labels[as.character(Group)]),
+      Estimate  = sprintf("%.3f", emmean),
+      SE        = sprintf("%.3f", SE),
+      df        = sprintf("%.0f", df),
+      CI        = sprintf("[%.3f, %.3f]", lower.CL, upper.CL)
+    )
+}
+
+bp_pair_tbl <- function(ct) {
+  as.data.frame(ct) %>%
+    transmute(
+      Contrast = relabel_groups_in_string(as.character(contrast)),
+      Estimate = sprintf("%.3f", estimate),
+      SE       = sprintf("%.3f", SE),
+      df       = sprintf("%.0f", df),
+      t        = sprintf("%.3f", t.ratio),
+      p        = fmt_p3(p.value),
+      stars    = stars_tex(stars3(p.value))
+    )
+}
+
+for (d in bp_dims$dim) {
+  dim_label <- bp_dims$label[bp_dims$dim == d]
+
+  bp_emm_tbl(bp_emms[[d]]) %>%
+    kable(format = "latex", booktabs = TRUE, escape = FALSE,
+          label = bp_label(paste0(d, "-emm")),
+          align = c("l", "r", "r", "r", "r"),
+          col.names = c("Condition", "$M$", "$SE$", "$df$", "95\\% CI"),
+          caption = paste0("Study 1 manipulation check: estimated marginal means for ",
+                           dim_label, ". ", bp_note)) %>%
+    kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+    kableExtra::save_kable(file = sprintf("tables/study1_botperception_%s_emmeans.tex", d))
+
+  bp_pair_tbl(bp_pairs[[d]]) %>%
+    kable(format = "latex", booktabs = TRUE, escape = FALSE,
+          label = bp_label(paste0(d, "-pairwise")),
+          align = c("l", "r", "r", "r", "r", "r", "l"),
+          col.names = c("Contrast", "Estimate", "$SE$", "$df$", "$t$", "$p_{\\text{Holm}}$", ""),
+          caption = paste0("Study 1 manipulation check: pairwise contrasts for ", dim_label,
+                           ". Two-sided $t$-tests, Holm-corrected within dimension. ", bp_note)) %>%
+    kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+    kableExtra::save_kable(file = sprintf("tables/study1_botperception_%s_pairwise.tex", d))
+}
+
+# GUARDS
+# 1. Every contrast must equal the difference of the two estimated marginal
+#    means it names, so the exported tables cannot silently disagree with the
+#    emmeans tables next to them.
+bp_contrast_gap <- function(emm, ct) {
+  mu    <- as.data.frame(emm)
+  mu    <- setNames(mu$emmean, as.character(mu$Group))
+  cd    <- as.data.frame(ct)
+  parts <- strsplit(as.character(cd$contrast), " - ", fixed = TRUE)
+  stopifnot(all(lengths(parts) == 2),
+            all(unlist(parts) %in% names(mu)))
+  expected <- vapply(parts, function(p) mu[[p[1]]] - mu[[p[2]]], numeric(1))
+  max(abs(cd$estimate - expected))
+}
+bp_gaps <- vapply(bp_dims$dim, function(d) bp_contrast_gap(bp_emms[[d]], bp_pairs[[d]]), numeric(1))
+stopifnot(all(bp_gaps < 1e-8))
+
+# 2. A large |t| with a p-value above .5 is the signature of the one-sided
+#    helper that produced the old tables (it left the "wrong tail" contrasts
+#    with p near 1). Two-sided tests can never do this.
+bp_all_pairs <- dplyr::bind_rows(lapply(bp_dims$dim, function(d) {
+  as.data.frame(bp_pairs[[d]]) %>% mutate(dim = d)
+}))
+stopifnot(!any(abs(bp_all_pairs$t.ratio) > 3 & bp_all_pairs$p.value > 0.5))
+
+cat(sprintf(paste0("Bot-perception exports written to tables/ (8 files).\n",
+                   "Guard 1: max |contrast - EMM difference| = %.2e\n",
+                   "Guard 2: contrasts with |t| > 3 and p > 0.5 = %d\n"),
+            max(bp_gaps),
+            sum(abs(bp_all_pairs$t.ratio) > 3 & bp_all_pairs$p.value > 0.5)))
+```
+
+
+
+```{r exploratory-engagement-robustness, message=FALSE, warning=FALSE}
+library(readxl)
+
+# 1. LOAD CHATBOT LOG
+# Path is relative to the Rmd's working directory (study_1/analysis/).
+chat_log <- readxl::read_excel("../data/Chatbot_data_collection_March_31_2026.xlsx")
+
+if (!inherits(chat_log$timestamp, "POSIXct")) {
+  chat_log$timestamp <- lubridate::ymd_hms(chat_log$timestamp, quiet = TRUE)
+}
+
+
+system_markers <- c("Flyer content shown", "Flyer completed", "")
+
+is_system_prompt <- function(x) {
+  !is.na(x) & grepl("^\\s*You are a", x) & nchar(x) > 1000
+}
+
+# The filtered log is kept as its own object so the log-integrity figures
+# below are computed from it rather than typed.
+chat_log_eng <- chat_log %>%
+  filter(condition != "flyer",
+         !is.na(prolific_pid), prolific_pid != "",
+         !is.na(user_message), !user_message %in% system_markers)
+
+n_system_prompt_rows <- sum(is_system_prompt(chat_log_eng$user_message))
+
+engagement_sessions <- chat_log_eng %>%
+  group_by(prolific_pid, session_id) %>%
+  summarise(
+    sess_turns  = sum(!is_system_prompt(user_message)),
+    sess_rows   = n(),
+    sess_opener = any(is_system_prompt(user_message)),
+    sess_duration = as.numeric(difftime(max(timestamp, na.rm = TRUE),
+                                        min(timestamp, na.rm = TRUE),
+                                        units = "mins")),
+    .groups = "drop"
+  ) %>%
+
+  mutate(sess_duration = if_else(sess_rows > 1, sess_duration, NA_real_))
+
+engagement <- engagement_sessions %>%
+  group_by(prolific_pid) %>%
+  summarise(
+    n_turns           = sum(sess_turns),
+    chat_duration_min = if (all(is.na(sess_duration))) NA_real_
+                        else sum(sess_duration, na.rm = TRUE),
+    # Engagement is only a verifiable dose if every session opener survived
+    # and every session yielded a usable interval.
+    log_complete      = all(sess_opener) & !any(is.na(sess_duration)),
+    .groups = "drop"
+  ) %>%
+  rename(PROLIFIC_PID = prolific_pid) %>%
+  mutate(
+    n_turns_nz      = ifelse(n_turns > 0, n_turns, NA_real_)
+  )
+
+engagement_prev <- chat_log_eng %>%
+  group_by(prolific_pid, session_id) %>%
+  summarise(sess_turns = n(), .groups = "drop") %>%
+  group_by(prolific_pid) %>%
+  summarise(n_turns_prev = sum(sess_turns), .groups = "drop") %>%
+  rename(PROLIFIC_PID = prolific_pid)
+
+
+n_sessions_logged       <- nrow(engagement_sessions)
+n_sessions_with_turns   <- sum(engagement_sessions$sess_turns > 0)
+n_sessions_missing_open <- sum(engagement_sessions$sess_turns > 0 &
+                                 !engagement_sessions$sess_opener)
+
+data_treatments_eng <- data_treatments %>%
+  left_join(engagement,      by = "PROLIFIC_PID") %>%
+  left_join(engagement_prev, by = "PROLIFIC_PID")
+
+turns_before_after <- data_treatments_eng %>%
+  group_by(Group) %>%
+  summarise(
+    n_log_before  = sum(!is.na(n_turns_prev)),
+    n_log_after   = sum(!is.na(n_turns)),
+    mean_before   = round(mean(n_turns_prev, na.rm = TRUE), 2),
+    mean_after    = round(mean(n_turns,      na.rm = TRUE), 2),
+    median_before = median(n_turns_prev, na.rm = TRUE),
+    median_after  = median(n_turns,      na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(Group = unname(condition_labels[as.character(Group)]))
+
+cat(sprintf(
+  paste0("Study 1 engagement correction (non-flyer sessions):\n",
+         "  system-prompt rows removed from the turn counts: %d\n",
+         "  sessions with at least one later turn: %d of %d logged sessions\n",
+         "  ... of those, opening system-prompt row missing: %d\n",
+         "  participants with any log rows (n_log): %d before, %d after\n",
+         "  per-condition turns, before vs after:\n"),
+  n_system_prompt_rows, n_sessions_with_turns, n_sessions_logged,
+  n_sessions_missing_open,
+  sum(turns_before_after$n_log_before), sum(turns_before_after$n_log_after)))
+
+# Widened locally so the seven before/after columns print on one line.
+local({
+  old_width <- options(width = 200)
+  on.exit(options(old_width))
+  print(as.data.frame(turns_before_after), row.names = FALSE)
+})
+
+
+log_coverage <- data_treatments_eng %>%
+  group_by(Group) %>%
+  summarise(
+    n            = n(),
+    no_log       = sum(is.na(n_turns)),
+    opener_only  = sum(!is.na(n_turns) & n_turns == 0),               # opener row survived, no later turn
+    partial_log  = sum(!is.na(n_turns) & n_turns > 0 & !log_complete),
+    complete_log = sum(!is.na(n_turns) & log_complete),
+    .groups = "drop"
+  ) %>%
+  mutate(Group = unname(condition_labels[as.character(Group)]))
+stopifnot(all(log_coverage$no_log + log_coverage$opener_only + log_coverage$partial_log + log_coverage$complete_log == log_coverage$n))
+
+log_coverage %>%
+  kable(col.names = c("Condition", "$n$", "No log rows", "Opener row only (0 turns)",
+                      "Partial log ($\\geq$1 turn)", "Complete log"),
+        caption = "Chatbot log coverage by condition. Rows were lost to Google Sheets write failures during high-concurrency recruitment, so engagement is only partially observed; the sensitivity refit in step 8 restricts to participants with complete logs.") %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+
+log_coverage %>%
+  kable(col.names = c("Condition", "$n$", "No log rows", "Opener row only (0 turns)",
+                      "Partial log ($\\geq$1 turn)", "Complete log"),
+        label = "supp_s1_log_coverage",
+        caption = "Study 1: chatbot log coverage by condition (\\textsc{Static Information} held out because those participants did not interact with a chatbot). Rows were lost to Google Sheets write failures during high-concurrency recruitment, so recorded engagement is a lower bound; the dose-response sensitivity refit is restricted to the complete-log column.",
+        format = "latex", booktabs = TRUE, escape = FALSE) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+  kableExtra::save_kable(file = "tables/study1_engagement_log_coverage.tex")
+
+engagement_desc <- data_treatments_eng %>%
+  group_by(Group) %>%
+  summarise(
+    n              = n(),
+    # The denominators behind the means: how many participants contributed any
+    # log row at all, and how many contributed a verifiably complete log.
+    n_log          = sum(!is.na(n_turns)),
+    n_complete     = sum(!is.na(n_turns) & log_complete),
+    n_turns_mean   = mean(n_turns,           na.rm = TRUE),
+    n_turns_sd     = sd(n_turns,             na.rm = TRUE),
+    n_turns_med    = median(n_turns,         na.rm = TRUE),
+    duration_mean  = mean(chat_duration_min, na.rm = TRUE),
+    duration_sd    = sd(chat_duration_min,   na.rm = TRUE),
+    duration_med   = median(chat_duration_min, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(Group = unname(condition_labels[as.character(Group)]))
+
+engagement_desc %>%
+  kable(digits = 2,
+        caption = "Chatbot engagement by condition (Static Information held out; participants in that condition did not interact with a chatbot)") %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+# LaTeX version for export, saved to tables/.
+engagement_desc %>%
+  kable(digits = 2,
+        col.names = c("Condition", "$n$", "$n$ with log", "$n$ complete log",
+                      "Turns: mean", "Turns: SD", "Turns: median",
+                      "Duration: mean", "Duration: SD", "Duration: median"),
+        label = "supp_s1_engagement_desc",
+        caption = "Study 1: recorded chatbot engagement by condition (\\textsc{Static Information} held out because those participants did not interact with a chatbot). Means and medians are computed over the participants with log rows, so they describe recorded engagement, a lower bound on actual engagement.",
+        format = "latex", booktabs = TRUE, escape = FALSE) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center",
+                            latex_options = "scale_down") %>%
+  kableExtra::save_kable(file = "tables/study1_engagement_descriptives.tex")
+```
+
+```{r engagement-summary-stats}
+
+ENG_DATA <- data_treatments_eng          
+
+engagement_summary_stats <- function(df, study_num) {
+  logged   <- dplyr::filter(df, !is.na(n_turns))
+  with_dur <- dplyr::filter(logged, !is.na(chat_duration_min))
+  stopifnot(nrow(logged) > 0, nrow(with_dur) > 0, nlevels(droplevels(factor(logged$Group))) > 1)
+
+  # Classical one-way ANOVAs, as described in the supplement (anova(lm()) has
+  # clean row names; summary(aov()) pads them with spaces).
+  a_turns <- anova(lm(n_turns ~ Group, data = logged))
+  a_dur   <- anova(lm(chat_duration_min ~ Group, data = with_dur))
+  # Sensitivity: zero recorded turns means only the opener survived, so the
+  # participant's own messages were lost; refit the turns ANOVA without them.
+  a_turns_nz <- anova(lm(n_turns ~ Group, data = dplyr::filter(logged, n_turns > 0)))
+  # Distribution-robust companions: recorded turns are zero-inflated (lost
+  # writes) and durations are right-skewed with unequal variances (Table 20).
+  w_turns  <- oneway.test(n_turns ~ Group, data = logged)
+  w_dur    <- oneway.test(chat_duration_min ~ Group, data = with_dur)
+  kw_turns <- kruskal.test(n_turns ~ Group, data = logged)
+  kw_dur   <- kruskal.test(chat_duration_min ~ Group, data = with_dur)
+
+  by_cond <- logged %>%
+    dplyr::group_by(Group) %>%
+    dplyr::summarise(mean_turns = mean(n_turns),
+                     mean_dur   = mean(chat_duration_min, na.rm = TRUE), .groups = "drop")
+
+  tibble::tibble(
+    study = study_num,
+    n_chatbot = nrow(df), n_logged = nrow(logged),
+    n_zero_turns = sum(logged$n_turns == 0),
+    n_nonzero = sum(logged$n_turns > 0),
+    n_duration = nrow(with_dur), n_complete = sum(logged$log_complete),
+    turns_F = a_turns["Group", "F value"], turns_df1 = a_turns["Group", "Df"],
+    turns_df2 = a_turns["Residuals", "Df"], turns_p = a_turns["Group", "Pr(>F)"],
+    turns_nz_F = a_turns_nz["Group", "F value"], turns_nz_df2 = a_turns_nz["Residuals", "Df"], turns_nz_p = a_turns_nz["Group", "Pr(>F)"],
+    dur_F = a_dur["Group", "F value"], dur_df1 = a_dur["Group", "Df"],
+    dur_df2 = a_dur["Residuals", "Df"], dur_p = a_dur["Group", "Pr(>F)"],
+    turns_welch_F = unname(w_turns$statistic), turns_welch_df2 = unname(w_turns$parameter[2]),
+    turns_welch_p = w_turns$p.value,
+    dur_welch_F = unname(w_dur$statistic), dur_welch_df2 = unname(w_dur$parameter[2]),
+    dur_welch_p = w_dur$p.value,
+    turns_kw_chisq = unname(kw_turns$statistic), turns_kw_p = kw_turns$p.value,
+    dur_kw_chisq = unname(kw_dur$statistic), dur_kw_p = kw_dur$p.value,
+    r_pearson  = cor(with_dur$n_turns, with_dur$chat_duration_min),
+    r_spearman = cor(with_dur$n_turns, with_dur$chat_duration_min, method = "spearman"),
+    mean_turns_all_logged   = mean(logged$n_turns),
+    median_turns_all_logged = median(logged$n_turns),
+    mean_turns_complete     = mean(logged$n_turns[logged$log_complete]),
+    mean_turns_partial      = mean(logged$n_turns[!logged$log_complete]),
+    mean_turns_nonzero      = mean(logged$n_turns[logged$n_turns > 0]),
+    most_turns_condition    = as.character(by_cond$Group[which.max(by_cond$mean_turns)]),
+    fewest_turns_condition  = as.character(by_cond$Group[which.min(by_cond$mean_turns)]),
+    longest_condition       = as.character(by_cond$Group[which.max(by_cond$mean_dur)])
+  )
+}
+
+eng_stats <- engagement_summary_stats(ENG_DATA, STUDY_NUM)
+
+# Consistency with the descriptives/coverage tables already exported above.
+stopifnot(eng_stats$n_logged   == sum(!is.na(ENG_DATA$n_turns)),
+          eng_stats$n_complete == sum(!is.na(ENG_DATA$n_turns) & ENG_DATA$log_complete))
+
+# ---- inline display ------------------------------------------------------------
+eng_stats_long <- tibble::tribble(
+  ~Quantity, ~Value,
+  "Chatbot participants (analysis sample)",                  sprintf("%d", eng_stats$n_chatbot),
+  "... with any log record",                                 sprintf("%d", eng_stats$n_logged),
+  "... of whom with zero recorded participant turns",        sprintf("%d", eng_stats$n_zero_turns),
+  "... with a measurable duration",                          sprintf("%d", eng_stats$n_duration),
+  "... with a verifiably complete log",                      sprintf("%d", eng_stats$n_complete),
+  "Turns ~ condition, one-way ANOVA",  sprintf("F(%d, %d) = %.2f, p %s", eng_stats$turns_df1, eng_stats$turns_df2, eng_stats$turns_F, p_txt(eng_stats$turns_p)),
+  "Turns ~ condition, Welch ANOVA",    sprintf("F(%d, %.1f) = %.2f, p %s", eng_stats$turns_df1, eng_stats$turns_welch_df2, eng_stats$turns_welch_F, p_txt(eng_stats$turns_welch_p)),
+  "Turns ~ condition, Kruskal-Wallis", sprintf("chi2(%d) = %.2f, p %s", eng_stats$turns_df1, eng_stats$turns_kw_chisq, p_txt(eng_stats$turns_kw_p)),
+  "Turns ~ condition, one-way ANOVA, zero-turn participants excluded",
+      sprintf("F(%d, %d) = %.2f, p %s (n = %d)", eng_stats$turns_df1, eng_stats$turns_nz_df2, eng_stats$turns_nz_F, p_txt(eng_stats$turns_nz_p), eng_stats$n_nonzero),
+  "Duration ~ condition, one-way ANOVA",  sprintf("F(%d, %d) = %.2f, p %s", eng_stats$dur_df1, eng_stats$dur_df2, eng_stats$dur_F, p_txt(eng_stats$dur_p)),
+  "Duration ~ condition, Welch ANOVA",    sprintf("F(%d, %.1f) = %.2f, p %s", eng_stats$dur_df1, eng_stats$dur_welch_df2, eng_stats$dur_welch_F, p_txt(eng_stats$dur_welch_p)),
+  "Duration ~ condition, Kruskal-Wallis", sprintf("chi2(%d) = %.2f, p %s", eng_stats$dur_df1, eng_stats$dur_kw_chisq, p_txt(eng_stats$dur_kw_p)),
+  "r(turns, duration), Pearson / Spearman", sprintf("%.2f / %.2f (n = %d)", eng_stats$r_pearson, eng_stats$r_spearman, eng_stats$n_duration),
+  "Mean recorded turns: all logged / complete / partial / nonzero only",
+      sprintf("%.2f / %.2f / %.2f / %.2f", eng_stats$mean_turns_all_logged, eng_stats$mean_turns_complete,
+              eng_stats$mean_turns_partial, eng_stats$mean_turns_nonzero),
+  "Most turns / fewest turns / longest duration (condition)",
+      sprintf("%s / %s / %s", eng_stats$most_turns_condition, eng_stats$fewest_turns_condition, eng_stats$longest_condition)
+)
+knitr::kable(eng_stats_long, caption = sprintf("Study %s: recorded-engagement summary statistics (Supplement E.2)", STUDY_NUM)) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center")
+
+# ---- LaTeX export ------------------------------------------------------------------
+eng_stats_long %>%
+  dplyr::mutate(Value = gsub("chi2", "$\\\\chi^2$", Value),
+                Value = gsub("p < .001", "$p < .001$", Value, fixed = TRUE),
+                Quantity = gsub("~", "$\\\\sim$", Quantity, fixed = TRUE),
+                Quantity = gsub("...", "\\\\quad\\\\ldots", Quantity, fixed = TRUE)) %>%
+  knitr::kable(format = "latex", booktabs = TRUE, escape = FALSE,
+               label = sprintf("supp_%s_engagement_stats", STUDY_TAG),
+               col.names = c("Quantity", "Value"),
+               caption = sprintf(paste0(
+                 "Study~%s: recorded chatbot engagement by condition -- one-way ANOVAs (classical, Welch, Kruskal--Wallis), ",
+                 "turns--duration correlation, and mean recorded turns by log completeness. Computed on participants with a log record; ",
+                 "recorded engagement is a lower bound on actual engagement (Section~E.2.1)."), STUDY_NUM)) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+  kableExtra::save_kable(file = sprintf("tables/study%s_engagement_summary_stats.tex", STUDY_NUM))
+
+# ---- LaTeX macros so Supplement E.2 prose cannot drift from the data -------------
+# Usage in the .tex: \input{tables/study1_engagement_macros.tex} in the preamble,
+# then e.g. "turns $F(\sOneEngTurnsDfOne, \sOneEngTurnsDfTwo) = \sOneEngTurnsF$, $p \sOneEngTurnsP$".
+mp <- c("1" = "sOne", "2" = "sTwo", "3" = "sThree")[[STUDY_NUM]]
+p_mac <- function(p) ifelse(p < 0.001, "< .001", sprintf("= %.3f", p))
+macros <- c(
+  sprintf("\\newcommand{\\%sEngNChatbot}{%d}",   mp, eng_stats$n_chatbot),
+  sprintf("\\newcommand{\\%sEngNLogged}{%d}",    mp, eng_stats$n_logged),
+  sprintf("\\newcommand{\\%sEngPctLogged}{%.0f}", mp, 100 * eng_stats$n_logged / eng_stats$n_chatbot),
+  sprintf("\\newcommand{\\%sEngNZeroTurns}{%d}", mp, eng_stats$n_zero_turns),
+  sprintf("\\newcommand{\\%sEngNDuration}{%d}",  mp, eng_stats$n_duration),
+  sprintf("\\newcommand{\\%sEngNComplete}{%d}",  mp, eng_stats$n_complete),
+  sprintf("\\newcommand{\\%sEngTurnsDfOne}{%d}", mp, eng_stats$turns_df1),
+  sprintf("\\newcommand{\\%sEngTurnsDfTwo}{%d}", mp, eng_stats$turns_df2),
+  sprintf("\\newcommand{\\%sEngTurnsF}{%.2f}",   mp, eng_stats$turns_F),
+  sprintf("\\newcommand{\\%sEngTurnsP}{%s}",     mp, p_mac(eng_stats$turns_p)),
+  sprintf("\\newcommand{\\%sEngDurDfOne}{%d}",   mp, eng_stats$dur_df1),
+  sprintf("\\newcommand{\\%sEngDurDfTwo}{%d}",   mp, eng_stats$dur_df2),
+  sprintf("\\newcommand{\\%sEngDurF}{%.2f}",     mp, eng_stats$dur_F),
+  sprintf("\\newcommand{\\%sEngDurP}{%s}",       mp, p_mac(eng_stats$dur_p)),
+  sprintf("\\newcommand{\\%sEngR}{%.2f}",        mp, eng_stats$r_pearson),
+  sprintf("\\newcommand{\\%sEngMeanTurnsAll}{%.2f}",      mp, eng_stats$mean_turns_all_logged),
+  sprintf("\\newcommand{\\%sEngMeanTurnsComplete}{%.2f}", mp, eng_stats$mean_turns_complete),
+  sprintf("\\newcommand{\\%sEngMostTurns}{%s}",   mp, relabel_groups_in_string(eng_stats$most_turns_condition)),
+  sprintf("\\newcommand{\\%sEngFewestTurns}{%s}", mp, relabel_groups_in_string(eng_stats$fewest_turns_condition)),
+  sprintf("\\newcommand{\\%sEngLongest}{%s}",     mp, relabel_groups_in_string(eng_stats$longest_condition))
+)
+writeLines(macros, sprintf("tables/study%s_engagement_macros.tex", STUDY_NUM))
+
+# ---- prose block for Supplement E.2 ------------------------------------------------
+cat(sprintf(paste0(
+  "\nStudy %s (Supplement E.2): a log could be matched to %d of %d chatbot participants (%.0f%%); ",
+  "a measurable duration was available for %d and a verifiably complete log for %d. ",
+  "%d logged participants have zero recorded participant turns (opener row only). ",
+  "Recorded engagement differed across conditions: turns F(%d, %d) = %.2f, p %s ",
+  "[Welch F(%d, %.1f) = %.2f, p %s; Kruskal-Wallis chi2(%d) = %.2f, p %s]; ",
+  "duration F(%d, %d) = %.2f, p %s [Welch p %s; KW p %s]. ",
+  "%s elicited the most turns, %s the longest conversations, %s the fewest turns. ",
+  "Turns and duration correlate r = %.2f (Spearman %.2f; n = %d). ",
+  "Mean recorded turns: complete logs %.2f vs all logged %.2f (partial %.2f; nonzero only %.2f).\n"),
+  STUDY_NUM, eng_stats$n_logged, eng_stats$n_chatbot, 100 * eng_stats$n_logged / eng_stats$n_chatbot,
+  eng_stats$n_duration, eng_stats$n_complete, eng_stats$n_zero_turns,
+  eng_stats$turns_df1, eng_stats$turns_df2, eng_stats$turns_F, p_txt(eng_stats$turns_p),
+  eng_stats$turns_df1, eng_stats$turns_welch_df2, eng_stats$turns_welch_F, p_txt(eng_stats$turns_welch_p),
+  eng_stats$turns_df1, eng_stats$turns_kw_chisq, p_txt(eng_stats$turns_kw_p),
+  eng_stats$dur_df1, eng_stats$dur_df2, eng_stats$dur_F, p_txt(eng_stats$dur_p),
+  p_txt(eng_stats$dur_welch_p), p_txt(eng_stats$dur_kw_p),
+  eng_stats$most_turns_condition, eng_stats$longest_condition, eng_stats$fewest_turns_condition,
+  eng_stats$r_pearson, eng_stats$r_spearman, eng_stats$n_duration,
+  eng_stats$mean_turns_complete, eng_stats$mean_turns_all_logged,
+  eng_stats$mean_turns_partial, eng_stats$mean_turns_nonzero))
+```
+
+```{r exploratory-engagement-robustness-2, message=FALSE, warning=FALSE}
+# 4. MERGE ENGAGEMENT INTO LONG LMM DATA VIA anon_id
+id_map <- data_treatments %>% select(anon_id, PROLIFIC_PID)
+
+lmm_data_eng <- lmm_data %>%
+  left_join(id_map,    by = "anon_id") %>%
+  left_join(engagement, by = "PROLIFIC_PID")
+
+
+eng_measures <- c(chat_duration_z = "chat_duration_min")
+
+standardise_eng <- function(data, eng_var) {
+  raw_var <- eng_measures[[eng_var]]
+  d <- data %>% filter(!is.na(.data[[raw_var]]))
+  per_participant <- d %>% distinct(anon_id, raw = .data[[raw_var]])
+  stopifnot(!anyDuplicated(per_participant$anon_id))     # one value per participant
+  per_participant[[eng_var]] <- as.numeric(scale(per_participant$raw))
+  d %>%
+    select(-any_of(eng_var)) %>%
+    left_join(per_participant %>% select(anon_id, all_of(eng_var)), by = "anon_id")
+}
+
+fit_eng_lmm <- function(dv_label, eng_var, data = lmm_data_eng) {
+  d <- standardise_eng(filter(data, DV == dv_label), eng_var)
+  f <- as.formula(
+    sprintf("score ~ Group * time + %s + time:%s + (1 | anon_id)", eng_var, eng_var)
+  )
+  lmer(f, data = d)
+}
+
+
+fit_primary_lmm_sub <- function(dv_label, eng_var, data = lmm_data_eng) {
+  d <- standardise_eng(filter(data, DV == dv_label), eng_var)
+  lmer(score ~ Group * time + (1 | anon_id), data = d)
+}
+
+lmm_DV1_dur <- fit_eng_lmm("DV1", "chat_duration_z")
+lmm_DV2_dur <- fit_eng_lmm("DV2", "chat_duration_z")
+lmm_DV3_dur <- fit_eng_lmm("DV3", "chat_duration_z")
+
+lmm_DV1_prim_dur <- fit_primary_lmm_sub("DV1", "chat_duration_z")
+lmm_DV2_prim_dur <- fit_primary_lmm_sub("DV2", "chat_duration_z")
+lmm_DV3_prim_dur <- fit_primary_lmm_sub("DV3", "chat_duration_z")
+
+# Checks: engagement enters each model with exactly one value per participant,
+# standardised (mean 0, SD 1) over that model's participants; and the
+# coefficient names are the intended terms.
+check_eng_model <- function(m, eng_var) {
+  fr <- m@frame
+  per_p <- fr %>% distinct(anon_id, .data[[eng_var]])
+  stopifnot(nrow(per_p) == n_distinct(fr$anon_id),
+            isTRUE(all.equal(mean(per_p[[eng_var]]), 0, tolerance = 1e-8)),
+            isTRUE(all.equal(sd(per_p[[eng_var]]),   1, tolerance = 1e-8)),
+            all(c(eng_var, paste0("timePost:", eng_var),
+                  "Groupdebunking:timePost", "Groupself_reflection:timePost",
+                  "Groupempathy:timePost", "Grouproleplay:timePost") %in% names(fixef(m))))
+  invisible(nrow(per_p))
+}
+invisible(lapply(list(lmm_DV1_dur, lmm_DV2_dur, lmm_DV3_dur), check_eng_model, eng_var = "chat_duration_z"))
+
+cat(sprintf("\nStudy %s: duration-adjusted LMM, DV2 (Refugee Support) -- formula and fixed effects\n", STUDY_NUM))
+print(formula(lmm_DV2_dur))
+print(round(summary(lmm_DV2_dur)$coefficients, 4))
+
+eng_control_labels <- c(chat_duration_z = "Chat Duration (z)")
+
+
+relabel_eng_term <- function(term, eng_var) {
+  dplyr::case_when(
+    term == paste0("timePost:", eng_var) ~ paste0("Post \u00D7 ", unname(eng_control_labels[eng_var])),
+    term == eng_var                      ~ unname(eng_control_labels[eng_var]),
+    TRUE                                 ~ relabel_term(term)
+  )
+}
+
+
+eng_contrasts <- function(model, dv_name, eng_var = NULL) {
+  tidy_df <- broom.mixed::tidy(model, effects = "fixed", conf.int = TRUE)
+
+  intervention_rows <- tidy_df %>%
+    filter(grepl("^Group.*:timePost$", term)) %>%
+    mutate(
+      Row         = "Intervention vs Neutral (at avg engagement)",
+      p_one_raw   = one_sided_p(p.value, estimate),
+      p_holm_within_dv = p.adjust(p_one_raw, method = "holm")
+    )
+
+  eng_rows <- if (is.null(eng_var)) NULL else
+    tidy_df %>%
+      filter(term %in% c(paste0("timePost:", eng_var), eng_var)) %>%
+      mutate(
+        Row       = ifelse(term == eng_var,
+                           "Engagement main effect (Pre level)",
+                           "Dose-response: Post \u00D7 Engagement"),
+        p_one_raw = ifelse(term == eng_var, p.value, one_sided_p(p.value, estimate)),
+        p_holm_within_dv = NA_real_
+      )
+
+  bind_rows(intervention_rows, eng_rows) %>%
+    transmute(
+      DV          = dv_labels[[dv_name]],
+      Eng_control = if (is.null(eng_var)) "None (primary model)" else unname(eng_control_labels[eng_var]),
+      Row,
+      Term        = if (is.null(eng_var)) relabel_term(term) else relabel_eng_term(term, eng_var),
+      Estimate    = round(estimate, 3),
+      SE          = round(std.error, 3),
+      t           = round(statistic, 3),
+      CI_low      = round(conf.low, 3),
+      CI_high     = round(conf.high, 3),
+      # one-sided for contrasts and dose-response; two-sided for the main effect
+      p_one_sided = round(p_one_raw, 4),
+      p_holm_within_dv = round(p_holm_within_dv, 4)
+    )
+}
+
+eng_tbl_dur <- bind_rows(
+  eng_contrasts(lmm_DV1_dur, "DV1", "chat_duration_z"),
+  eng_contrasts(lmm_DV2_dur, "DV2", "chat_duration_z"),
+  eng_contrasts(lmm_DV3_dur, "DV3", "chat_duration_z")
+)
+
+eng_tbl_prim_dur <- bind_rows(eng_contrasts(lmm_DV1_prim_dur, "DV1"),
+                              eng_contrasts(lmm_DV2_prim_dur, "DV2"),
+                              eng_contrasts(lmm_DV3_prim_dur, "DV3"))
+
+eng_tbl_dur_title <- "Exploratory Robustness: Engagement-Controlled LMMs (Control = Chat Duration, z-standardized within the model sample). Model: score ~ Group x Time + Engagement + Engagement x Time + (1 | participant). Holm correction applied within DV across the 4 treatment-vs-Neutral interaction contrasts only; dose-response row one-sided and unadjusted; engagement main effect two-sided. 95\\% CIs two-sided and unadjusted. Not preregistered as primary."
+
+eng_tbl_dur %>%
+  kable(caption = eng_tbl_dur_title, escape = FALSE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+
+eng_tbl_colnames <- c("DV", "Engagement control", "Row", "Term", "Estimate", "SE", "$t$",
+                      "LB$_{95}$", "UB$_{95}$", "$p$", "$p_{\\mathrm{Holm}}$")
+save_engagement_table_tex <- function(tbl, title, file) {
+  tbl %>%
+    kable(caption = title, format = "latex", booktabs = TRUE, escape = FALSE,
+          col.names = eng_tbl_colnames) %>%
+    kableExtra::kable_styling(full_width = FALSE, position = "center",
+                              latex_options = "scale_down") %>%
+    kableExtra::save_kable(file = file)
+}
+
+save_engagement_table_tex(eng_tbl_dur, eng_tbl_dur_title, sprintf("tables/study%s_engagement_duration.tex", STUDY_NUM))
+
+
+primary_estimates <- bind_rows(contr_DV1, contr_DV2, contr_DV3) %>%
+  transmute(
+    DV,
+    Term = term,
+    Estimate_primary = round(Estimate, 3),
+    p_one_primary    = round(p_one_sided, 4),
+    p_holm_primary   = round(p_holm_within_dv, 4)
+  )
+# The full-sample primary column is taken from the confirmatory objects
+# themselves (contr_DV1/2/3), so it reproduces the primary estimates exactly.
+stopifnot(nrow(primary_estimates) == 12,
+          isTRUE(all.equal(primary_estimates$Estimate_primary,
+                           round(c(contr_DV1$Estimate, contr_DV2$Estimate, contr_DV3$Estimate), 3))))
+
+contrast_block <- function(tbl, suffix) {
+  tbl %>%
+    filter(Row == "Intervention vs Neutral (at avg engagement)") %>%
+    transmute(DV, Term,
+              !!paste0("Estimate_", suffix) := Estimate,
+              !!paste0("p_one_",    suffix) := p_one_sided,
+              !!paste0("p_holm_",   suffix) := p_holm_within_dv)
+}
+
+eng_compare <- primary_estimates %>%
+  left_join(contrast_block(eng_tbl_prim_dur, "prim_dur"), by = c("DV", "Term")) %>%
+  left_join(contrast_block(eng_tbl_dur,      "dur"),      by = c("DV", "Term"))
+stopifnot(nrow(eng_compare) == 12, !anyNA(eng_compare))
+
+n_participants_lmer <- function(m) length(unique(m@frame$anon_id))
+n_dur_models <- vapply(list(lmm_DV1_dur, lmm_DV2_dur, lmm_DV3_dur), n_participants_lmer, integer(1))
+stopifnot(length(unique(n_dur_models)) == 1,
+          n_participants_lmer(lmm_DV1_prim_dur) == n_dur_models[1],
+          n_dur_models[1] == sum(!is.na(data_treatments_eng$chat_duration_min)))
+n_primary <- nrow(data_treatments)
+
+eng_compare_title <- sprintf(paste0(
+  "Study~%s: engagement-controlled robustness -- primary vs duration-adjusted estimates of the four ",
+  "treatment-vs-\\textsc{Neutral} Condition $\\times$ Post contrasts per outcome. Est.\\ = Condition $\\times$ Post ",
+  "coefficient; $p$ one-sided (H1: estimate $>$ 0), uncorrected; $p_{\\mathrm{Holm}}$ Holm-corrected within outcome ",
+  "across the four contrasts, separately for each column. Primary (full sample): preregistered model on all %d chatbot ",
+  "participants. Duration-adjusted: the same model plus a participant-level chat-duration main effect and a ",
+  "Duration $\\times$ Time term (score $\\sim$ Condition $\\times$ Time + Duration + Duration $\\times$ Time + ",
+  "(1 $|$ participant)), chat duration $z$-standardised within the model's sample, fitted on the $n = %d$ ",
+  "participants with a measurable duration. Primary (duration subsample): the primary model without engagement ",
+  "refitted on those same %d participants, so that the difference between the last two columns isolates the ",
+  "adjustment from the change in sample. 95\\%% CIs for all contrasts are given in the per-model table."),
+  STUDY_NUM, n_primary, n_dur_models[1], n_dur_models[1])
+
+eng_compare_header <- c(" " = 2, "Primary (full sample)" = 3, "Primary (duration subsample)" = 3, "Duration-adjusted" = 3)
+eng_compare_colnames <- c("DV", "Term", rep(c("Est.", "$p$", "$p_{\\mathrm{Holm}}$"), 3))
+
+eng_compare_fmt <- eng_compare %>%
+  mutate(across(starts_with("Estimate_"), ~ sprintf("%.3f", .x)),
+         across(c(starts_with("p_one_"), starts_with("p_holm_")), fmt_p3))
+
+eng_compare_fmt %>%
+  kable(caption = eng_compare_title, escape = FALSE, col.names = eng_compare_colnames) %>%
+  kableExtra::add_header_above(eng_compare_header) %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+# LaTeX export of the comparison table.
+eng_compare_fmt %>%
+  kable(caption = eng_compare_title, label = sprintf("supp_%s_engagement_comparison", STUDY_TAG),
+        format = "latex", booktabs = TRUE, escape = FALSE, col.names = eng_compare_colnames) %>%
+  kableExtra::add_header_above(eng_compare_header, escape = FALSE) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center", latex_options = "scale_down") %>%
+  kableExtra::save_kable(file = sprintf("tables/study%s_engagement_comparison.tex", STUDY_NUM))
+
+# Long-format export with SE and 95% CI for every contrast of every column.
+readr::write_csv(
+  bind_rows(
+    bind_rows(contr_DV1, contr_DV2, contr_DV3) %>%
+      transmute(DV, Eng_control = "None (primary model)", Row = "Intervention vs Neutral (at avg engagement)",
+                Term = term, Estimate = round(Estimate, 3), SE = round(SE, 3), t = round(t, 3),
+                CI_low = round(CI_low, 3), CI_high = round(CI_high, 3),
+                p_one_sided = round(p_one_sided, 4), p_holm_within_dv = round(p_holm_within_dv, 4)) %>%
+      mutate(Model = "Primary (full sample)", n = n_primary),
+    eng_tbl_prim_dur %>% mutate(Model = "Primary (duration subsample)", n = n_dur_models[1]),
+    eng_tbl_dur      %>% mutate(Model = "Duration-adjusted",            n = n_dur_models[1])
+  ) %>% mutate(study = STUDY_NUM) %>% select(study, Model, n, everything()),
+  sprintf("tables/study%s_engagement_adjusted_contrasts.csv", STUDY_NUM))
+
+
+eng_main_effect <- eng_tbl_dur %>%
+  filter(Row == "Engagement main effect (Pre level)") %>%
+  mutate(n = n_dur_models[1]) %>%
+  select(DV, Eng_control, n, Estimate, SE, t, CI_low, CI_high, p_two_sided = p_one_sided)
+stopifnot(nrow(eng_main_effect) == 3)
+
+eng_main_effect_title <- sprintf(paste0(
+  "Study~%s: engagement main effect ($\\eta$) in the duration-adjusted linear mixed-effects models ",
+  "(coefficient of $z$-standardised chat duration; with Time dummy-coded, Pre = 0, this is the ",
+  "association between recorded chat duration and the pre-intervention score). SE and 95\\%% CI Wald; $p$ two-sided, ",
+  "uncorrected."), STUDY_NUM)
+
+eng_main_effect %>%
+  kable(caption = eng_main_effect_title, escape = FALSE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+eng_main_effect %>%
+  mutate(Estimate = sprintf("%.3f", Estimate), SE = sprintf("%.3f", SE), t = sprintf("%.3f", t),
+         CI = sprintf("[%.3f, %.3f]", CI_low, CI_high), p_two_sided = fmt_p3(p_two_sided)) %>%
+  select(DV, n, Estimate, SE, t, CI, p_two_sided) %>%
+  kable(caption = eng_main_effect_title, label = sprintf("supp_%s_engagement_main_effect", STUDY_TAG),
+        format = "latex", booktabs = TRUE, escape = FALSE,
+        col.names = c("Outcome", "$n$", "$\\eta$", "SE", "$t$", "95\\% CI", "$p$")) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+  kableExtra::save_kable(file = sprintf("tables/study%s_engagement_main_effect.tex", STUDY_NUM))
+
+readr::write_csv(eng_main_effect %>% mutate(study = STUDY_NUM),
+                 sprintf("tables/study%s_engagement_main_effect.csv", STUDY_NUM))
+
+
+eng_dose_response <- eng_tbl_dur %>%
+  filter(Row == "Dose-response: Post \u00D7 Engagement") %>%
+  mutate(n = n_dur_models[1]) %>%
+  select(DV, Eng_control, n, Estimate, SE, t, CI_low, CI_high, p_one_sided)
+stopifnot(nrow(eng_dose_response) == 3)
+
+eng_dose_response_title <- sprintf(paste0(
+  "Study~%s: dose--response coefficient ($\\lambda$) in the duration-adjusted linear mixed-effects models ",
+  "(Time $\\times$ Duration term; change in pre--post improvement per SD of chat duration, ",
+  "$z$-standardised within the model's sample; models also include the duration main effect). ",
+  "SE and 95\\%% CI Wald, two-sided; $p$ one-sided (H1: $\\lambda > 0$), uncorrected."), STUDY_NUM)
+
+eng_dose_response %>%
+  kable(caption = eng_dose_response_title, escape = FALSE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+eng_dose_response %>%
+  mutate(Estimate = sprintf("%.3f", Estimate), SE = sprintf("%.3f", SE), t = sprintf("%.3f", t),
+         CI = sprintf("[%.3f, %.3f]", CI_low, CI_high), p_one_sided = fmt_p3(p_one_sided)) %>%
+  select(DV, n, Estimate, SE, t, CI, p_one_sided) %>%
+  kable(caption = eng_dose_response_title, label = sprintf("supp_%s_engagement_dose_response", STUDY_TAG),
+        format = "latex", booktabs = TRUE, escape = FALSE,
+        col.names = c("Outcome", "$n$", "$\\lambda$", "SE", "$t$", "95\\% CI", "$p$")) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+  kableExtra::save_kable(file = sprintf("tables/study%s_engagement_dose_response.tex", STUDY_NUM))
+
+readr::write_csv(eng_dose_response %>% mutate(study = STUDY_NUM),
+                 sprintf("tables/study%s_engagement_dose_response.csv", STUDY_NUM))
+
+
+eng_condition_r2 <- local({
+  d <- data_treatments_eng %>% filter(!is.na(chat_duration_min))
+  fit <- lm(chat_duration_min ~ Group, data = d)
+  a <- anova(fit)
+  tibble::tibble(
+    Eng_measure = "Chat duration (min)",
+    n           = nrow(d),
+    R2          = summary(fit)$r.squared,
+    R2_adj      = summary(fit)$adj.r.squared,
+    F           = a["Group", "F value"],
+    df1         = a["Group", "Df"],
+    df2         = a["Residuals", "Df"],
+    p           = a["Group", "Pr(>F)"]
+  )
+})
+stopifnot(eng_condition_r2$n == n_dur_models[1])
+
+eng_condition_r2_title <- sprintf(paste0(
+  "Study~%s: dependence of recorded chat duration on condition. $R^2$ ($= \\eta^2$) of raw chat duration ",
+  "regressed on condition (one-way OLS, five chatbot conditions), computed on the participants entering the ",
+  "duration-adjusted model."), STUDY_NUM)
+
+eng_condition_r2 %>%
+  mutate(across(c(R2, R2_adj, F), ~ round(.x, 3)), p = round(p, 4)) %>%
+  kable(caption = eng_condition_r2_title, escape = FALSE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+eng_condition_r2 %>%
+  transmute(Eng_measure, n, R2 = sprintf("%.3f", R2), R2_adj = sprintf("%.3f", R2_adj),
+            F = sprintf("$F(%d, %d) = %.2f$", df1, df2, F), p = fmt_p3(p)) %>%
+  kable(caption = eng_condition_r2_title, label = sprintf("supp_%s_engagement_condition_r2", STUDY_TAG),
+        format = "latex", booktabs = TRUE, escape = FALSE,
+        col.names = c("Engagement measure", "$n$", "$R^2$", "adj.\\ $R^2$", "$F$", "$p$")) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+  kableExtra::save_kable(file = sprintf("tables/study%s_engagement_condition_r2.tex", STUDY_NUM))
+
+readr::write_csv(eng_condition_r2 %>% mutate(study = STUDY_NUM),
+                 sprintf("tables/study%s_engagement_condition_r2.csv", STUDY_NUM))
+
+cat(sprintf("\nStudy %s: R^2 of chat duration on condition = %.3f (n = %d)\n",
+            STUDY_NUM, eng_condition_r2$R2[1], eng_condition_r2$n[1]))
+
+eng_dose_row <- function(model, dv_name, eng_var, sample_label) {
+  eng_contrasts(model, dv_name, eng_var) %>%
+    filter(Row == "Dose-response: Post \u00D7 Engagement") %>%
+    transmute(DV, Eng_control, Sample = sample_label, Estimate, SE, t, CI_low, CI_high, p_one_sided)
+}
+
+lmm_data_eng_complete <- filter(lmm_data_eng, log_complete)
+
+eng_dose_sensitivity <- bind_rows(
+  eng_dose_row(lmm_DV1_dur, "DV1", "chat_duration_z", "All participants with a duration"),
+  eng_dose_row(lmm_DV2_dur, "DV2", "chat_duration_z", "All participants with a duration"),
+  eng_dose_row(lmm_DV3_dur, "DV3", "chat_duration_z", "All participants with a duration"),
+  eng_dose_row(fit_eng_lmm("DV1", "chat_duration_z", lmm_data_eng_complete), "DV1", "chat_duration_z", "Complete logs only"),
+  eng_dose_row(fit_eng_lmm("DV2", "chat_duration_z", lmm_data_eng_complete), "DV2", "chat_duration_z", "Complete logs only"),
+  eng_dose_row(fit_eng_lmm("DV3", "chat_duration_z", lmm_data_eng_complete), "DV3", "chat_duration_z", "Complete logs only")
+)
+
+n_logged_eng   <- sum(!is.na(data_treatments_eng$n_turns))
+n_duration_eng <- sum(!is.na(data_treatments_eng$chat_duration_min))
+n_complete_eng <- sum(!is.na(data_treatments_eng$n_turns) & data_treatments_eng$log_complete)
+
+eng_dose_sensitivity_title <- sprintf(
+  "Dose-Response Sensitivity to Chatbot Log Completeness (n = %d participants with a measurable duration, of %d with any log rows; n = %d with complete logs). Estimates are the Post x Duration term (lambda) from the duration-adjusted LMMs (which also include the duration main effect); chat duration z-standardized within each model's sample. p one-sided, uncorrected; 95\\%% CI two-sided, unadjusted.",
+  n_duration_eng, n_logged_eng, n_complete_eng
+)
+
+eng_dose_sensitivity %>%
+  kable(caption = eng_dose_sensitivity_title, escape = FALSE) %>%
+  kable_styling(full_width = FALSE, position = "center")
+
+eng_dose_sensitivity %>%
+  kable(caption = eng_dose_sensitivity_title, format = "latex",
+        booktabs = TRUE, escape = FALSE,
+        col.names = c("DV", "Engagement control", "Sample", "Estimate", "SE", "$t$",
+                      "LB$_{95}$", "UB$_{95}$", "$p$")) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+  kableExtra::save_kable(file = sprintf("tables/study%s_engagement_log_sensitivity.tex", STUDY_NUM))
+
+readr::write_csv(
+  eng_dose_sensitivity %>%
+    dplyr::mutate(study = STUDY_NUM,
+                  n_logged   = n_logged_eng,
+                  n_duration = n_duration_eng,
+                  n_complete = n_complete_eng),
+  sprintf("tables/study%s_engagement_dose_sensitivity.csv", STUDY_NUM))
+```
+
+
+# Multiverse robustness (sidedness x Holm scope)
+
+The primary in-text confirmatory result above uses one-sided p-values (H1: treatments improve outcomes, estimate > 0) with Holm correction within each DV (across 4 treatment-vs-Neutral interaction contrasts). The table below re-expresses the same 12 contrasts (4 treatments x 3 DVs) under a 2 (sidedness) x 3 (Holm scope) grid of analytical choices. No additional models are refit; only the p-value reweighting and adjustment varies. The row matching the primary specification (`one_sided` x `within_dv`) is marked PRIMARY.
+
+```{r}
+
+build_multiverse <- function(contrast_df_list) {
+  all_contrasts <- dplyr::bind_rows(contrast_df_list, .id = "DV")
+
+  one_spec <- function(side, scope) {
+    df <- all_contrasts %>%
+      dplyr::mutate(
+        p_raw = if (side == "two_sided") p_two
+                else one_sided_p(p_two, estimate)
+      )
+
+    if (scope == "none") {
+      df$p_adj <- df$p_raw
+    } else if (scope == "within_dv") {
+      df <- df %>%
+        dplyr::group_by(DV) %>%
+        dplyr::mutate(p_adj = p.adjust(p_raw, "holm")) %>%
+        dplyr::ungroup()
+    } else {
+      df$p_adj <- p.adjust(df$p_raw, "holm")
+    }
+
+    df %>% dplyr::mutate(
+      sidedness  = side,
+      holm_scope = scope,
+      primary    = (side == "one_sided") & (scope == "within_dv")
+    )
+  }
+
+  specs <- tidyr::expand_grid(
+    sidedness  = c("two_sided", "one_sided"),
+    holm_scope = c("none", "within_dv", "across_dv")
+  )
+
+  purrr::map2_dfr(specs$sidedness, specs$holm_scope, one_spec)
+}
+
+format_multiverse <- function(mv) {
+  mv %>%
+    dplyr::mutate(
+      Contrast      = contrast,
+      Estimate      = sprintf("%.3f", estimate),
+      SE            = sprintf("%.3f", SE),
+      p_raw         = sprintf("%.3f", p_raw),
+      p_adj         = sprintf("%.3f", p_adj),
+      stars = dplyr::case_when(
+        p_adj < 0.001 ~ "***",
+        p_adj < 0.01  ~ "**",
+        p_adj < 0.05  ~ "*",
+        p_adj < 0.10  ~ "+",
+        TRUE          ~ ""
+      ),
+      Spec   = ifelse(primary,
+                      paste0("PRIMARY: ", sidedness, " x ", holm_scope),
+                      paste0(sidedness, " x ", holm_scope))
+    ) %>%
+    dplyr::select(DV, Contrast, Estimate, SE, Spec, p_raw, p_adj, stars)
+}
+
+
+mv_input <- list(
+  Perceptions = contr_DV1 %>% dplyr::transmute(
+    contrast = term, estimate = Estimate, SE = SE, p_two = p_two_sided
+  ),
+  `Refugee Support` = contr_DV2 %>% dplyr::transmute(
+    contrast = term, estimate = Estimate, SE = SE, p_two = p_two_sided
+  ),
+  `Policy Endorsement` = contr_DV3 %>% dplyr::transmute(
+    contrast = term, estimate = Estimate, SE = SE, p_two = p_two_sided
+  )
+)
+
+multiverse_tbl <- build_multiverse(mv_input)
+
+format_multiverse(multiverse_tbl) %>%
+  dplyr::arrange(DV, Contrast, Spec) %>%
+  kable(
+    caption = "Multiverse robustness: 2 (sidedness) x 3 (Holm scope) x 12 contrasts (4 treatments x 3 DVs). PRIMARY = primary specification (one-sided x within-DV Holm)."
+  ) %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+
