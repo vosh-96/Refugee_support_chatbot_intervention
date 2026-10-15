@@ -1049,7 +1049,7 @@ lmm_data <- lmm_data %>%
     )
   )
 
-desired_order <- c("neutral", "self_reflection", "empathy", "roleplay", "debunking")
+desired_order <- c("neutral", "debunking", "self_reflection", "empathy", "roleplay")
 
 dv_scales <- list(
   DV1 = c(1, 5),
@@ -1064,11 +1064,11 @@ dv_plot_labels <- list(
 )
 
 facet_labels <- c(
-  neutral         = "Neutral",
-  self_reflection = "Interview",
-  empathy         = "Empathy",
-  roleplay        = "Roleplay",
-  debunking       = "Debunking"
+  neutral         = "NEUTRAL",
+  debunking       = "DEBUNKING",
+  self_reflection = "INTERVIEW",
+  empathy         = "EMPATHY",
+  roleplay        = "ROLEPLAY"
 )
 
 plot_dv <- function(dv_name, show_n = FALSE) {

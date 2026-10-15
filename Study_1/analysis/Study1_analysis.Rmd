@@ -878,7 +878,7 @@ library(tidyverse)
 library(lme4)
 library(patchwork)
 
-desired_order <- c("neutral", "self_reflection", "empathy", "roleplay", "debunking")  # Debunking moved to the end
+desired_order <- c("neutral", "debunking", "self_reflection", "empathy", "roleplay")  # Debunking after Neutral, Roleplay last
 
 dv_scales <- list(
   DV1 = c(1, 5),
@@ -893,11 +893,11 @@ dv_plot_labels <- list(
 )
 
 facet_labels <- c(
-  neutral         = "Neutral",
-  self_reflection = "Interview",
-  empathy         = "Empathy",
-  roleplay        = "Roleplay",
-  debunking       = "Debunking"
+  neutral         = "NEUTRAL",
+  debunking       = "DEBUNKING",
+  self_reflection = "INTERVIEW",
+  empathy         = "EMPATHY",
+  roleplay        = "ROLEPLAY"
 )
 
 plot_dv <- function(dv_name, show_n = FALSE) {

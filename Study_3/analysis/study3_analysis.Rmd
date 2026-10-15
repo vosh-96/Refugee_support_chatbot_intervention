@@ -1309,7 +1309,7 @@ save_contrast_table_tex(
 
 
 ```{r, fig.width=10, fig.height=15}
-desired_order <- c("Neutral", "Interview", "Empathy", "Roleplay", "Debunking")
+desired_order <- c("Neutral", "Debunking", "Interview", "Empathy", "Roleplay")
 
 # Axes are shown on the original response scales (DV1: 1-5 Likert;
 # DV2/DV3: 0-100 sliders), matching the other study figures. Models are still
@@ -1444,7 +1444,11 @@ plot_dv_fu <- function(dv_name) {
       parse = TRUE, size = 2.9, vjust = 2.3, inherit.aes = FALSE
     ) +
     scale_fill_manual(values = cond_colors) +
-    scale_x_discrete(labels = c("Neutral" = "Neutral (ref.)")) +
+    scale_x_discrete(labels = c("Neutral"   = "NEUTRAL (ref.)",
+                                "Debunking" = "DEBUNKING",
+                                "Interview" = "INTERVIEW",
+                                "Empathy"   = "EMPATHY",
+                                "Roleplay"  = "ROLEPLAY")) +
     labs(x = NULL, y = dv_plot_labels[[dv_name]]) +
     scale_y_continuous(
       limits = y_limits,
@@ -2349,7 +2353,7 @@ post_sample_alignment %>%
 
 
 ```{r, fig.width=10, fig.height=15}
-dur_order <- c("Neutral", "Interview", "Empathy", "Roleplay", "Debunking")
+dur_order <- c("Neutral", "Debunking", "Interview", "Empathy", "Roleplay")
 
 plot_data_dur <- dur_long %>%
   mutate(
@@ -2365,11 +2369,11 @@ plot_data_dur <- dur_long %>%
   )
 
 # Neutral is the reference category, which the facet strip states explicitly.
-dur_facet_labels <- c("Neutral"   = "Neutral (ref.)",
-                      "Debunking" = "Debunking",
-                      "Interview" = "Interview",
-                      "Empathy"   = "Empathy",
-                      "Roleplay"  = "Roleplay")
+dur_facet_labels <- c("Neutral"   = "NEUTRAL (ref.)",
+                      "Debunking" = "DEBUNKING",
+                      "Interview" = "INTERVIEW",
+                      "Empathy"   = "EMPATHY",
+                      "Roleplay"  = "ROLEPLAY")
 
 # No "(Follow-Up)" suffix here: these panels span both time points.
 dur_plot_labels <- list(DV1 = "Perceptions",
